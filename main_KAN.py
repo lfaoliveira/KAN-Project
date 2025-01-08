@@ -136,7 +136,7 @@ class Trainer:
 
 
 class BboxLoss(nn.Module):
-    """Criterion class for computing training losses during training."""
+    """Criterion class for computing training losses during training. Uses GIoU as a main loss"""
 
     def __init__(self):
         """Initialize the BboxLoss module"""
