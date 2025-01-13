@@ -3,7 +3,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Subset, DataLoader, Dataset
-
+import torch.optim as optim
+from torchvision.io import read_image
 import pandas as pd
 import os
 import sys
@@ -83,56 +84,81 @@ class KAN_CNN(nn.Module):
         return x
 
 
+def calc_features_conv(nn_conv_module: nn.Module, input_shape):
+    input_teste = np.random.uniform()
+    output = nn_conv_module()
+
+
 class ConvModule(nn.Module):
-    def __init__(self, layers_hidden, base_activation=nn.ReLU):
+    def __init__(self, num_classes):
         super(ConvModule, self).__init__()
 
-        # quant de hidden layers
-        self.layers_hidden = layers_hidden
-        # Feature extractor with Convolutional layers
-        self.feature_extractor = nn.Sequential(
-            nn.Conv2d(
-                1, 16, kernel_size=3, stride=1, padding=1
-            ),  # 1 input channel (grayscale), 16 output channels
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
+        # Define the backbone CNN
+
+        self.backbone = nn.Sequential(
+            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            nn.SELU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            # Add more layers as needed
         )
-        self.base_activation = base_activation
+
+        # Define the classifier head
+        self.classifier = nn.Sequential(
+            nn.Linear(out_features=num_classes),
+            # Add more layers as needed
+        )
+        # Define the bounding box regressor head
+        self.bbox_regressor = nn.Sequential(
+            nn.Linear(out_features=4),
+            # Add more layers as needed
+        )
 
     def forward(self, x):
-        # Reshape input from [batch_size, 784] to [batch_size, 1, 28, 28] for MNIST
-
-        # nao precisa pra minha rede
-        x = self.feature_extractor(x)
-        x = self.base_activation(x)
-        return x
+        features = self.backbone(x)
+        # Flatten features for the heads
+        features = features.view(features.size(0), -1)
+        class_logits = self.classifier(in_features=features)
+        bbox_coords = self.bbox_regressor(in_features=features)
+        return class_logits, bbox_coords
 
 
 class Trainer:
-    def __init__(self, PATH_YOLO, epochs=10):
-
+    def __init__(self, PATH_YOLO, epochs=10, lr_decay=7, gamma=0.1):
+        """
+        PATH_YOLO:path containing images and labels in the YOLO format.
+        epochs:
+        lr_decay: how many epochs to decay lr
+        gamma: factor for subtracting lr.
+        """
+        device = torch.cuda.current_device()
         dataset = MyDataset(PATH_YOLO)
         DATALOADER = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4)
         model = ConvModule()
-        criterion = BboxLoss()  # For classification tasks
+        fn_loss = BboxLoss()  # For classification tasks
+        lr_scheduler = optim.lr_scheduler.StepLR(
+            optimizer, step_size=lr_decay, gamma=gamma
+        )
+        optimizer = optim.Adam(model.parameters())
 
-        optimizer = torch.optim.Adam(model.parameters())
         for epoch in range(epochs):  # Define the number of epochs
-            for inputs, labels in DATALOADER:  # Assuming data_loader is defined
+            model.train()
+            for images, targets in DATALOADER:
+                # convertion to GPU tensor
+                images = images.to(device)
+                labels = targets["classes"].to(device)
+                bbox_targets = targets["boxes"].to(device)
+
                 # Forward pass
-                outputs = model(inputs)
-                print(type(outputs), outputs)
-                pred_bboxes = outputs
-                target_bboxes = labels
-                loss = criterion(pred_bboxes, target_bboxes, target_scores_sum, fg_mask)
+                optimizer.zero_grad()
+                class_logits, bbox_preds = model(images)
+                print(type(class_logits, bbox_preds), class_logits, bbox_preds)
+                loss = fn_loss(class_logits, bbox_preds, labels, bbox_targets)
 
                 # Backward pass
-                optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
+
+            lr_scheduler.step()
 
 
 class BboxLoss(nn.Module):
@@ -144,19 +170,21 @@ class BboxLoss(nn.Module):
 
     def forward(
         self,
-        pred_bboxes,
-        target_bboxes,
-        target_scores_sum,
-        fg_mask,
+        class_logits,
+        bbox_preds,
+        labels,
+        bbox_targets,
     ):
-        """IoU loss."""
+        """IoU loss.
         # weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = Metricas.bbox_iou(
             pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, GIoU=True
         )
         loss_iou = ((1.0 - iou)).sum() / target_scores_sum
-
-        return loss_iou
+        """
+        classification_loss = F.cross_entropy(class_logits, labels)
+        bbox_loss = F.smooth_l1_loss(bbox_preds, bbox_targets)
+        return classification_loss + bbox_loss
 
 
 class Metricas:
@@ -216,10 +244,30 @@ class MyDataset(Dataset):
         # Store the data and labels
         self.inicializar_dataset(PATH_YOLO)
         df_dados = self.df
-        data = list(df_dados.loc[:, "PATH"].to_dict().values())
+        lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
+        data = []
+        for path in lista_path_img:
+            data.append(read_image(path))
+        # array com imagens
         self.data = np.array(data)
-        # print("DATA: ", data)
-        labels = list(df_dados.loc[:, "LABEL"].to_dict().values())
+
+        lista_path_labels = list(df_dados.loc[:, "LABEL"].to_dict().values())
+
+        labels = []
+        for path in lista_path_labels:
+            linhas = open(path, "r").readlines()
+            classes, bboxes = [], []
+            targets = {"class": classes, "bbox": bboxes}
+            for linha in linhas:
+                splitado = linha.split(" ")
+                classe = splitado[0]
+                classes.append(classe)
+                coords = [float(elem.replace("\n", "")) for elem in splitado[1:]]
+                bboxes.append(coords)
+
+            labels.append(targets)
+
+        # array com classes e bboxes
         self.labels = np.array(labels)
         assert len(self.labels) == len(self.data)
 
@@ -227,20 +275,27 @@ class MyDataset(Dataset):
         # Total number of samples
         return len(self.data)
 
-    def __getitem__(self, idx):
+    """def __getitem__(self, idx):
         # Fetch the data and label at the given index
         sample = self.data[idx]
         label = self.labels[idx]
-        return sample, label
+        return sample, label """
 
-    def __getitems__(self):
-        return self.data, self.labels
+    def __getitem__(self, idx):
+        """
+        Retorna imagem(tensor torch) e target(dict contendo tensores com bbox e classe)
+        """
+        image = self.data[idx]
+        boxes = torch.tensor(self.labels[idx]["bbox"], dtype=torch.float32)
+        labels = torch.tensor(self.labels[idx]["class"], dtype=torch.int16)
+        target = {"boxes": boxes, "classes": labels}
+
+        return image, target
 
     def generate_data(self, PATH_YOLO):
         """
         Faz walk no path especificado e retorna lista de imagens e labels
         """
-
         lista_imagens = list()
         lista_labels = list()
         lista_dirs = ["train", "valid", "test"]
@@ -272,11 +327,12 @@ class MyDataset(Dataset):
         POSICOES = ["PPO", "INFRA", "SUPRA", "LEVO", "DEXTRO"]
 
         lista_img, lista_labels = self.generate_data(PATH_YOLO)
+        # ordenacao necessaria pra garantir repoducibilidade
         lista_img = sorted(lista_img, key=lambda x: os.path.basename(x).split("-")[0])
         lista_labels = sorted(
             lista_labels, key=lambda x: os.path.basename(x).split("-")[0]
         )
-        # ordenacao necessaria pra garantir repoducibilidade
+        # cria tuplas pra inserir dentro do df
         tuplas_info = []
         for x in lista_img:
             splitado = os.path.basename(x).replace(".JPG", "").split("-")
@@ -305,7 +361,8 @@ class MyDataset(Dataset):
         self.y = np.array(self.df["LABEL"].tolist())
 
         # utiliza id de paciente como id para grupo
-        self.grupos_pac = self.df.index.get_level_values(0).tolist()
+        # apenas usar em cross-validation.
+        # self.grupos_pac = self.df.index.get_level_values(0).tolist()
 
         """path_out = "out.csv"
         if os.path.exists(path_out):
@@ -317,3 +374,6 @@ class MyDataset(Dataset):
             id = tupla[0]
             grupos[id].append(label) """
         return
+
+
+# -------------------------------------MAIN------------------------------------#
