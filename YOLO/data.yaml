@@ -1,0 +1,7 @@
+names:
+- flash
+- limbo
+nc: 2
+test: ../test/images
+train: /content/datasets/DATA_SET2/YOLO/train/images
+val: /content/datasets/DATA_SET2/YOLO/valid/images

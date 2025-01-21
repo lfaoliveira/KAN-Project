@@ -76,7 +76,8 @@ class KAN_CNN(nn.Module):
             self.base_weights, self.poly_weights, self.batch_norms
         ):
             base_output = base_weight(x)
-            monomial_basis = self.compute_efficient_monomials(x, self.polynomial_order)
+            monomial_basis = self.compute_efficient_monomials(
+                x, self.polynomial_order)
             monomial_basis = monomial_basis.view(x.size(0), -1)
             poly_output = poly_weight(monomial_basis)
             x = self.base_activation(batch_norm(base_output + poly_output))
@@ -132,8 +133,9 @@ class Trainer:
         """
         device = torch.cuda.current_device()
         dataset = MyDataset(PATH_YOLO)
-        DATALOADER = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4)
-        model = ConvModule()
+        DATALOADER = DataLoader(dataset, batch_size=4,
+                                shuffle=True, num_workers=4)
+        model = ConvModule(2)
         fn_loss = BboxLoss()  # For classification tasks
         lr_scheduler = optim.lr_scheduler.StepLR(
             optimizer, step_size=lr_decay, gamma=gamma
@@ -210,7 +212,8 @@ class Metricas:
         """
         # Get the coordinates of bounding boxes
         if xywh:  # transform from xywh to xyxy
-            (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
+            (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(
+                4, -1), box2.chunk(4, -1)
             w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
             b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
             b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
@@ -262,7 +265,8 @@ class MyDataset(Dataset):
                 splitado = linha.split(" ")
                 classe = splitado[0]
                 classes.append(classe)
-                coords = [float(elem.replace("\n", "")) for elem in splitado[1:]]
+                coords = [float(elem.replace("\n", ""))
+                          for elem in splitado[1:]]
                 bboxes.append(coords)
 
             labels.append(targets)
@@ -312,7 +316,8 @@ class MyDataset(Dataset):
                     arq = os.path.basename(arq_imagem).replace(".JPG", "")
                     arq_imagem = os.path.join(images, arq_imagem)
                     arq_label = os.path.join(
-                        labels, os.path.basename(arq_imagem).replace(".JPG", ".txt")
+                        labels, os.path.basename(
+                            arq_imagem).replace(".JPG", ".txt")
                     )
                     lista_imagens.append(arq_imagem)
                     lista_labels.append(arq_label)
@@ -328,7 +333,8 @@ class MyDataset(Dataset):
 
         lista_img, lista_labels = self.generate_data(PATH_YOLO)
         # ordenacao necessaria pra garantir repoducibilidade
-        lista_img = sorted(lista_img, key=lambda x: os.path.basename(x).split("-")[0])
+        lista_img = sorted(
+            lista_img, key=lambda x: os.path.basename(x).split("-")[0])
         lista_labels = sorted(
             lista_labels, key=lambda x: os.path.basename(x).split("-")[0]
         )
@@ -343,12 +349,14 @@ class MyDataset(Dataset):
             tuplas_info.append((id, pos))
 
         dict_df = {"PATH": None, "LABEL": None}
-        multi_index = pd.MultiIndex.from_tuples(tuplas_info, names=["ID", "POSICAO"])
+        multi_index = pd.MultiIndex.from_tuples(
+            tuplas_info, names=["ID", "POSICAO"])
         self.df = pd.DataFrame(dict_df, index=multi_index)
 
         # povoa o dataframe com path de imagem e de label para cada paciente e posicao
         for path_img, path_label in zip(lista_img, lista_labels):
-            splitado = os.path.basename(path_img).replace(".JPG", "").split("-")
+            splitado = os.path.basename(
+                path_img).replace(".JPG", "").split("-")
             ID, POSICAO = splitado[:2]
             if POSICAO not in POSICOES:
                 continue
@@ -377,3 +385,9 @@ class MyDataset(Dataset):
 
 
 # -------------------------------------MAIN------------------------------------#
+PATH_YOLO = os.path.join(os.getcwd(), "YOLO")
+
+if not os.path.exists(PATH_YOLO):
+    raise SystemError("Path YOLO nao existe")
+
+trainer = Trainer(PATH_YOLO)
