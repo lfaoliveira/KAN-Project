@@ -9,6 +9,7 @@ import pandas as pd
 import os
 import sys
 import wandb
+import shutil
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -76,17 +77,13 @@ class KAN_CNN(nn.Module):
             self.base_weights, self.poly_weights, self.batch_norms
         ):
             base_output = base_weight(x)
-            monomial_basis = self.compute_efficient_monomials(x, self.polynomial_order)
+            monomial_basis = self.compute_efficient_monomials(
+                x, self.polynomial_order)
             monomial_basis = monomial_basis.view(x.size(0), -1)
             poly_output = poly_weight(monomial_basis)
             x = self.base_activation(batch_norm(base_output + poly_output))
 
         return x
-
-
-def calc_features_conv(nn_conv_module: nn.Module, input_shape):
-    input_teste = np.random.uniform()
-    output = nn_conv_module()
 
 
 class ConvModule(nn.Module):
@@ -99,10 +96,13 @@ class ConvModule(nn.Module):
             nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
             nn.SELU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            nn.SELU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
             # Add more layers as needed
         )
 
-        # Define the classifier head
+        """ # Define the classifier head
         self.classifier = nn.Sequential(
             nn.Linear(out_features=num_classes),
             # Add more layers as needed
@@ -111,43 +111,48 @@ class ConvModule(nn.Module):
         self.bbox_regressor = nn.Sequential(
             nn.Linear(out_features=4),
             # Add more layers as needed
-        )
+        ) """
 
     def forward(self, x):
         features = self.backbone(x)
         # Flatten features for the heads
-        features = features.view(features.size(0), -1)
-        class_logits = self.classifier(in_features=features)
-        bbox_coords = self.bbox_regressor(in_features=features)
-        return class_logits, bbox_coords
+        # features = features.view(features.size(0), -1)
+        # class_logits = self.classifier(in_features=features)
+        # bbox_coords = self.bbox_regressor(in_features=features)
+        return features
 
 
 class Trainer:
-    def __init__(self, PATH_YOLO, epochs=10, lr_decay=7, gamma=0.1):
+    def __init__(self, PATH_YOLO):
         """
-        PATH_YOLO:path containing images and labels in the YOLO format.
-        epochs:
-        lr_decay: how many epochs to decay lr
-        gamma: factor for subtracting lr.
+        Parameters\n
+        ---------------
+        ``PATH_YOLO``: path containing images and labels in the YOLO format.
+        ``epochs``:
+        ``decay_step``: how many epochs to decay lr
+        ``lr_decay``: factor for subtracting lr.
         """
-        device = torch.cuda.current_device()
-        dataset = MyDataset(PATH_YOLO)
-        DATALOADER = DataLoader(dataset, batch_size=4, shuffle=True, num_workers=4)
-        model = ConvModule()
+        self.device = torch.cuda.current_device()
+        self.dataset = MyDataset(PATH_YOLO)
+        self.DATALOADER = DataLoader(
+            self.dataset, batch_size=4, shuffle=True, num_workers=4
+        )
+
+    def train(self, epochs=10, decay_step=7, lr_decay=0.1):
+        model = ConvModule(num_classes=2).to(self.device)
         fn_loss = BboxLoss()  # For classification tasks
         lr_scheduler = optim.lr_scheduler.StepLR(
-            optimizer, step_size=lr_decay, gamma=gamma
+            optimizer, step_size=decay_step, gamma=lr_decay
         )
         optimizer = optim.Adam(model.parameters())
 
         for epoch in range(epochs):  # Define the number of epochs
             model.train()
-            for images, targets in DATALOADER:
+            for images, targets in self.DATALOADER:
                 # convertion to GPU tensor
-                images = images.to(device)
-                labels = targets["classes"].to(device)
-                bbox_targets = targets["boxes"].to(device)
-
+                images = images.to(self.device)
+                labels = targets["classes"].to(self.device)
+                bbox_targets = targets["boxes"].to(self.device)
                 # Forward pass
                 optimizer.zero_grad()
                 class_logits, bbox_preds = model(images)
@@ -157,7 +162,6 @@ class Trainer:
                 # Backward pass
                 loss.backward()
                 optimizer.step()
-
             lr_scheduler.step()
 
 
@@ -210,7 +214,8 @@ class Metricas:
         """
         # Get the coordinates of bounding boxes
         if xywh:  # transform from xywh to xyxy
-            (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(4, -1), box2.chunk(4, -1)
+            (x1, y1, w1, h1), (x2, y2, w2, h2) = box1.chunk(
+                4, -1), box2.chunk(4, -1)
             w1_, h1_, w2_, h2_ = w1 / 2, h1 / 2, w2 / 2, h2 / 2
             b1_x1, b1_x2, b1_y1, b1_y2 = x1 - w1_, x1 + w1_, y1 - h1_, y1 + h1_
             b2_x1, b2_x2, b2_y1, b2_y2 = x2 - w2_, x2 + w2_, y2 - h2_, y2 + h2_
@@ -262,7 +267,8 @@ class MyDataset(Dataset):
                 splitado = linha.split(" ")
                 classe = splitado[0]
                 classes.append(classe)
-                coords = [float(elem.replace("\n", "")) for elem in splitado[1:]]
+                coords = [float(elem.replace("\n", ""))
+                          for elem in splitado[1:]]
                 bboxes.append(coords)
 
             labels.append(targets)
@@ -312,7 +318,8 @@ class MyDataset(Dataset):
                     arq = os.path.basename(arq_imagem).replace(".JPG", "")
                     arq_imagem = os.path.join(images, arq_imagem)
                     arq_label = os.path.join(
-                        labels, os.path.basename(arq_imagem).replace(".JPG", ".txt")
+                        labels, os.path.basename(
+                            arq_imagem).replace(".JPG", ".txt")
                     )
                     lista_imagens.append(arq_imagem)
                     lista_labels.append(arq_label)
@@ -328,7 +335,8 @@ class MyDataset(Dataset):
 
         lista_img, lista_labels = self.generate_data(PATH_YOLO)
         # ordenacao necessaria pra garantir repoducibilidade
-        lista_img = sorted(lista_img, key=lambda x: os.path.basename(x).split("-")[0])
+        lista_img = sorted(
+            lista_img, key=lambda x: os.path.basename(x).split("-")[0])
         lista_labels = sorted(
             lista_labels, key=lambda x: os.path.basename(x).split("-")[0]
         )
@@ -343,12 +351,14 @@ class MyDataset(Dataset):
             tuplas_info.append((id, pos))
 
         dict_df = {"PATH": None, "LABEL": None}
-        multi_index = pd.MultiIndex.from_tuples(tuplas_info, names=["ID", "POSICAO"])
+        multi_index = pd.MultiIndex.from_tuples(
+            tuplas_info, names=["ID", "POSICAO"])
         self.df = pd.DataFrame(dict_df, index=multi_index)
 
         # povoa o dataframe com path de imagem e de label para cada paciente e posicao
         for path_img, path_label in zip(lista_img, lista_labels):
-            splitado = os.path.basename(path_img).replace(".JPG", "").split("-")
+            splitado = os.path.basename(
+                path_img).replace(".JPG", "").split("-")
             ID, POSICAO = splitado[:2]
             if POSICAO not in POSICOES:
                 continue
@@ -377,3 +387,38 @@ class MyDataset(Dataset):
 
 
 # -------------------------------------MAIN------------------------------------#
+
+# MODE LOCAL == running outside of Google Colab
+MODO = "LOCAL"
+if os.path.exists("/content"):
+    MODO = "COLAB"
+else:
+    MODO = "LOCAL"
+# --SETTING PATH_DATASET-- #
+if MODO == "COLAB":
+    PATH_DATASET = os.path.join("/content", "datasets", "DATA_SET2")
+else:
+    PATH_DATASET = os.path.join(os.getcwd(), "datasets")
+
+
+if not os.path.exists(PATH_DATASET):
+    if MODO != "LOCAL":
+        from google.colab.patches import cv2_imshow
+        from google.colab import drive
+
+        drive.mount("/content/drive")
+        shutil.copytree(
+            "/content/drive/MyDrive/DATASETS DE SEGMENTAÇÃO/SCRIPTS/",
+            "/content/datasets/DATA_SET2/SCRIPTS/",
+        )
+        shutil.copytree(
+            "/content/drive/MyDrive/DATASETS DE SEGMENTAÇÃO/DADOS/YOLO",
+            "/content/datasets/DATA_SET2/YOLO",
+        )
+    # raise error when dataset not present
+    else:
+        raise SystemError("Dataset not found")
+
+PATH_YOLO = os.path.join(PATH_DATASET, "YOLO")
+trainer = Trainer(PATH_YOLO)
+trainer.train(epochs=10)
