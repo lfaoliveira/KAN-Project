@@ -148,6 +148,7 @@ class Trainer:
 
         for epoch in range(epochs):  # Define the number of epochs
             model.train()
+            # TODO: adaptar targets pra ter classes e estrabismo
             for images, targets in self.DATALOADER:
                 # convertion to GPU tensor
                 images = images.to(self.device)
@@ -247,6 +248,7 @@ class Metricas:
 class MyDataset(Dataset):
     def __init__(self, PATH_YOLO):
         # Store the data and labels
+        # TODO: MUDAR DATASET PARA TER LABEL COMO tupla do estrabismo
         self.inicializar_dataset(PATH_YOLO)
         df_dados = self.df
         lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
