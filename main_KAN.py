@@ -134,6 +134,7 @@ class Trainer:
         """
         self.device = torch.cuda.current_device()
         self.dataset = MyDataset(PATH_YOLO, filename_tabela)
+        print("DF MYDATASET: ", self.dataset.df)
         self.DATALOADER = DataLoader(
             self.dataset, batch_size=4, shuffle=True, num_workers=4
         )
@@ -297,8 +298,15 @@ class MyDataset(Dataset):
 
         dict_df = {}
         for posicao in self.POSICOES:
-            dict_df[posicao] = pd.read_excel(
-                (self.path_tabela), sheet_name=posicao, index_col=0)
+            ler_colunas = ['PAC.', 'TIPO', 'DH', 'TIPO.1', 'DV', 'FIXADOR']
+            df = pd.read_excel(
+                self.path_tabela, sheet_name=posicao, usecols=ler_colunas, index_col=0)
+            df = df.rename(columns={"TIPO": "TIPO_H", "TIPO.1": "TIPO_V"})
+            df.index = df.index.astype('<U16')
+            dict_df[posicao] = df.dropna(how="any")
+
+            print(dict_df[posicao])
+        print("--------------------------------------\n\n")
 
         lista_dirs = ["train", "valid", "test"]
         for diretorio in lista_dirs:
@@ -311,22 +319,31 @@ class MyDataset(Dataset):
                 for arq_imagem in lista_arq:
                     if ".JPG" not in arq_imagem:
                         continue
-                    arq = os.path.basename(arq_imagem).replace(".JPG", "")
-                    splitado = os.path.basename(
-                        arq).replace(".JPG", "").split("-")
+
+                    arq = os.path.basename(
+                        arq_imagem).replace(".JPG", "")
+                    print(arq)
+                    splitado = os.path.basename(arq).split("-")
                     id = splitado[0]
                     pos = splitado[1]
+                    if pos not in self.POSICOES:
+                        continue
 
                     arq_imagem = os.path.join(images, arq_imagem)
                     id_format = str(int(id))
+                    print("ID: ", type(id_format), id_format)
+                    print("DF INDEX: ", dict_df[pos].index.to_list(),
+                          type(dict_df[pos].index.to_list()[10]), "\n")
+
                     entrada_df = dict_df[pos].loc[id_format]
+                    print("ENTRADA DF: \n", entrada_df, "\n\n")
                     tupla_label = [f"{id_format}-{pos}",
-                                   float(entrada_df["DH"].values()),
-                                   float(entrada_df["DV"].values())]
+                                   float(entrada_df["DH"]),
+                                   float(entrada_df["DV"])]
 
                     lista_imagens.append(arq_imagem)
                     lista_labels.append(tupla_label)
-        del dict_df
+
         return lista_imagens, lista_labels
 
     def inicializar_dataset(self, PATH_YOLO):
@@ -342,6 +359,7 @@ class MyDataset(Dataset):
         lista_labels = sorted(
             lista_labels, key=lambda x: x[0]
         )
+        print("LABELS:", lista_labels)
         # cria tuplas pra inserir dentro do df
         tuplas_info = []
         for x in lista_img:
@@ -368,7 +386,7 @@ class MyDataset(Dataset):
                 path_img,
                 tupla_label[2:],
             ]
-        print(self.df)
+            print(self.df.loc[indexer[ID, POSICAO], ["PATH", "LABEL"]])
         self.X = np.array(self.df.index.to_list())
         self.y = np.array(self.df["LABEL"].tolist())
 
@@ -381,7 +399,7 @@ class MyDataset(Dataset):
             os.remove(path_out)
         self.df.to_csv(path_out, index=True)"""
 
-        """ 
+        """
         for tupla, label in zip(X, y):
             id = tupla[0]
             grupos[id].append(label) """
@@ -423,5 +441,6 @@ if not os.path.exists(PATH_DATASET):
 
 PATH_YOLO = os.path.join(PATH_DATASET, "YOLO")
 filename_tabela = "DiagnosticoEspecialista_Tese_Dallyson (ATUALIZADO).xlsx"
+path_tabela = os.path.join(PATH_DATASET, filename_tabela)
 trainer = Trainer(PATH_YOLO, filename_tabela)
 trainer.train(epochs=10)
