@@ -9,6 +9,7 @@ import pandas as pd
 import os
 import sys
 import wandb
+import shutil
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -85,11 +86,6 @@ class KAN_CNN(nn.Module):
         return x
 
 
-def calc_features_conv(nn_conv_module: nn.Module, input_shape):
-    input_teste = np.random.uniform()
-    output = nn_conv_module()
-
-
 class ConvModule(nn.Module):
     def __init__(self, num_classes):
         super(ConvModule, self).__init__()
@@ -100,10 +96,13 @@ class ConvModule(nn.Module):
             nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
             nn.SELU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            nn.SELU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
             # Add more layers as needed
         )
 
-        # Define the classifier head
+        """ # Define the classifier head
         self.classifier = nn.Sequential(
             nn.Linear(out_features=num_classes),
             # Add more layers as needed
@@ -112,62 +111,65 @@ class ConvModule(nn.Module):
         self.bbox_regressor = nn.Sequential(
             nn.Linear(out_features=4),
             # Add more layers as needed
-        )
+        ) """
 
     def forward(self, x):
         features = self.backbone(x)
         # Flatten features for the heads
-        features = features.view(features.size(0), -1)
-        class_logits = self.classifier(in_features=features)
-        bbox_coords = self.bbox_regressor(in_features=features)
-        return class_logits, bbox_coords
+        # features = features.view(features.size(0), -1)
+        # class_logits = self.classifier(in_features=features)
+        # bbox_coords = self.bbox_regressor(in_features=features)
+        return features
 
 
 class Trainer:
-    def __init__(self, PATH_YOLO, epochs=10, lr_decay=7, gamma=0.1):
+    def __init__(self, PATH_YOLO, filename_tabela):
         """
-        PATH_YOLO:path containing images and labels in the YOLO format.
-        epochs:
-        lr_decay: how many epochs to decay lr
-        gamma: factor for subtracting lr.
+        Parameters\n
+        ---------------
+        ``PATH_YOLO``: path containing images and labels in the YOLO format.
+        ``epochs``:
+        ``decay_step``: how many epochs to decay lr
+        ``lr_decay``: factor for subtracting lr.
         """
-        device = torch.cuda.current_device()
-        dataset = MyDataset(PATH_YOLO)
-        DATALOADER = DataLoader(dataset, batch_size=4,
-                                shuffle=True, num_workers=4)
-        model = ConvModule(2)
-        fn_loss = BboxLoss()  # For classification tasks
+        self.device = torch.cuda.current_device()
+        self.dataset = MyDataset(PATH_YOLO, filename_tabela)
+        self.DATALOADER = DataLoader(
+            self.dataset, batch_size=4, shuffle=True, num_workers=4
+        )
+
+    def train(self, epochs=10, decay_step=7, lr_decay=0.1):
+        model = ConvModule(num_classes=2).to(self.device)
+        # fn_loss = BboxLoss()  # For classification tasks
+        fn_loss = nn.MSELoss()
         lr_scheduler = optim.lr_scheduler.StepLR(
-            optimizer, step_size=lr_decay, gamma=gamma
+            optimizer, step_size=decay_step, gamma=lr_decay
         )
         optimizer = optim.Adam(model.parameters())
 
         for epoch in range(epochs):  # Define the number of epochs
             model.train()
-            for images, targets in DATALOADER:
+            for images, targets in self.DATALOADER:
                 # convertion to GPU tensor
-                images = images.to(device)
-                labels = targets["classes"].to(device)
-                bbox_targets = targets["boxes"].to(device)
-
+                images = images.to(self.device)
+                labels = targets.to(self.device)
                 # Forward pass
                 optimizer.zero_grad()
-                class_logits, bbox_preds = model(images)
-                print(type(class_logits, bbox_preds), class_logits, bbox_preds)
-                loss = fn_loss(class_logits, bbox_preds, labels, bbox_targets)
+                estrabismo = model(images)
+                print(type(estrabismo, labels), estrabismo, labels)
+                loss = fn_loss(estrabismo, labels)
 
                 # Backward pass
                 loss.backward()
                 optimizer.step()
-
             lr_scheduler.step()
 
 
-class BboxLoss(nn.Module):
-    """Criterion class for computing training losses during training. Uses GIoU as a main loss"""
+""" class BboxLoss(nn.Module):
+    '''Criterion class for computing training losses during training. Uses GIoU as a main loss'''
 
     def __init__(self):
-        """Initialize the BboxLoss module"""
+        '''Initialize the BboxLoss module'''
         super().__init__()
 
     def forward(
@@ -177,16 +179,17 @@ class BboxLoss(nn.Module):
         labels,
         bbox_targets,
     ):
-        """IoU loss.
+        '''IoU loss.
         # weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
         iou = Metricas.bbox_iou(
             pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, GIoU=True
         )
         loss_iou = ((1.0 - iou)).sum() / target_scores_sum
-        """
+        '''
         classification_loss = F.cross_entropy(class_logits, labels)
         bbox_loss = F.smooth_l1_loss(bbox_preds, bbox_targets)
         return classification_loss + bbox_loss
+ """
 
 
 class Metricas:
@@ -243,8 +246,12 @@ class Metricas:
 
 
 class MyDataset(Dataset):
-    def __init__(self, PATH_YOLO):
+    def __init__(self, PATH_YOLO, filename_tabela):
         # Store the data and labels
+        self.POSICOES = ["PPO", "INFRA", "SUPRA", "LEVO", "DEXTRO"]
+
+        self.path_tabela = os.path.join(PATH_DATASET, filename_tabela)
+
         self.inicializar_dataset(PATH_YOLO)
         df_dados = self.df
         lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
@@ -254,23 +261,8 @@ class MyDataset(Dataset):
         # array com imagens
         self.data = np.array(data)
 
-        lista_path_labels = list(df_dados.loc[:, "LABEL"].to_dict().values())
-
-        labels = []
-        for path in lista_path_labels:
-            linhas = open(path, "r").readlines()
-            classes, bboxes = [], []
-            targets = {"class": classes, "bbox": bboxes}
-            for linha in linhas:
-                splitado = linha.split(" ")
-                classe = splitado[0]
-                classes.append(classe)
-                coords = [float(elem.replace("\n", ""))
-                          for elem in splitado[1:]]
-                bboxes.append(coords)
-
-            labels.append(targets)
-
+        # lista contendo tuplas de estrabismo H e V
+        labels = list(df_dados.loc[:, "LABEL"].to_dict().values())
         # array com classes e bboxes
         self.labels = np.array(labels)
         assert len(self.labels) == len(self.data)
@@ -302,26 +294,39 @@ class MyDataset(Dataset):
         """
         lista_imagens = list()
         lista_labels = list()
+
+        dict_df = {}
+        for posicao in self.POSICOES:
+            dict_df[posicao] = pd.read_excel(
+                (self.path_tabela), sheet_name=posicao, index_col=0)
+
         lista_dirs = ["train", "valid", "test"]
         for diretorio in lista_dirs:
             print("DIRETORIO: ", diretorio)
             print("_____________________________________")
             images = os.path.join(PATH_YOLO, diretorio, "images")
-            labels = os.path.join(PATH_YOLO, diretorio, "labels")
+
             for root, dir, lista_arq in os.walk(images):
                 print(root)
                 for arq_imagem in lista_arq:
                     if ".JPG" not in arq_imagem:
                         continue
                     arq = os.path.basename(arq_imagem).replace(".JPG", "")
-                    arq_imagem = os.path.join(images, arq_imagem)
-                    arq_label = os.path.join(
-                        labels, os.path.basename(
-                            arq_imagem).replace(".JPG", ".txt")
-                    )
-                    lista_imagens.append(arq_imagem)
-                    lista_labels.append(arq_label)
+                    splitado = os.path.basename(
+                        arq).replace(".JPG", "").split("-")
+                    id = splitado[0]
+                    pos = splitado[1]
 
+                    arq_imagem = os.path.join(images, arq_imagem)
+                    id_format = str(int(id))
+                    entrada_df = dict_df[pos].loc[id_format]
+                    tupla_label = [f"{id_format}-{pos}",
+                                   float(entrada_df["DH"].values()),
+                                   float(entrada_df["DV"].values())]
+
+                    lista_imagens.append(arq_imagem)
+                    lista_labels.append(tupla_label)
+        del dict_df
         return lista_imagens, lista_labels
 
     def inicializar_dataset(self, PATH_YOLO):
@@ -329,20 +334,19 @@ class MyDataset(Dataset):
         Gera df escreve em csv contendo o df
         Retorna IDs de Imagem, labels de imagem
         """
-        POSICOES = ["PPO", "INFRA", "SUPRA", "LEVO", "DEXTRO"]
 
         lista_img, lista_labels = self.generate_data(PATH_YOLO)
         # ordenacao necessaria pra garantir repoducibilidade
         lista_img = sorted(
             lista_img, key=lambda x: os.path.basename(x).split("-")[0])
         lista_labels = sorted(
-            lista_labels, key=lambda x: os.path.basename(x).split("-")[0]
+            lista_labels, key=lambda x: x[0]
         )
         # cria tuplas pra inserir dentro do df
         tuplas_info = []
         for x in lista_img:
             splitado = os.path.basename(x).replace(".JPG", "").split("-")
-            if splitado[1] not in POSICOES or len(splitado) != 2:
+            if splitado[1] not in self.POSICOES or len(splitado) != 2:
                 continue
             id = splitado[0]
             pos = splitado[1]
@@ -354,17 +358,17 @@ class MyDataset(Dataset):
         self.df = pd.DataFrame(dict_df, index=multi_index)
 
         # povoa o dataframe com path de imagem e de label para cada paciente e posicao
-        for path_img, path_label in zip(lista_img, lista_labels):
-            splitado = os.path.basename(
-                path_img).replace(".JPG", "").split("-")
+        for path_img, tupla_label in zip(lista_img, lista_labels):
+            splitado = os.path.basename(path_img) \
+                .replace(".JPG", "").split("-")
             ID, POSICAO = splitado[:2]
-            if POSICAO not in POSICOES:
+            if POSICAO not in self.POSICOES:
                 continue
             self.df.loc[indexer[ID, POSICAO], ["PATH", "LABEL"]] = [
                 path_img,
-                path_label,
+                tupla_label[2:],
             ]
-
+        print(self.df)
         self.X = np.array(self.df.index.to_list())
         self.y = np.array(self.df["LABEL"].tolist())
 
@@ -385,9 +389,39 @@ class MyDataset(Dataset):
 
 
 # -------------------------------------MAIN------------------------------------#
-PATH_YOLO = os.path.join(os.getcwd(), "YOLO")
 
-if not os.path.exists(PATH_YOLO):
-    raise SystemError("Path YOLO nao existe")
+# MODE LOCAL == running outside of Google Colab
+MODO = "LOCAL"
+if os.path.exists("/content"):
+    MODO = "COLAB"
+else:
+    MODO = "LOCAL"
+# --SETTING PATH_DATASET-- #
+if MODO == "COLAB":
+    PATH_DATASET = os.path.join("/content", "datasets", "DATA_SET2")
+else:
+    PATH_DATASET = os.path.join(os.getcwd(), "datasets")
 
-trainer = Trainer(PATH_YOLO)
+
+if not os.path.exists(PATH_DATASET):
+    if MODO != "LOCAL":
+        from google.colab.patches import cv2_imshow
+        from google.colab import drive
+
+        drive.mount("/content/drive")
+        shutil.copytree(
+            "/content/drive/MyDrive/DATASETS DE SEGMENTAÇÃO/SCRIPTS/",
+            "/content/datasets/DATA_SET2/SCRIPTS/",
+        )
+        shutil.copytree(
+            "/content/drive/MyDrive/DATASETS DE SEGMENTAÇÃO/DADOS/YOLO",
+            "/content/datasets/DATA_SET2/YOLO",
+        )
+    # raise error when dataset not present
+    else:
+        raise SystemError("Dataset not found")
+
+PATH_YOLO = os.path.join(PATH_DATASET, "YOLO")
+filename_tabela = "DiagnosticoEspecialista_Tese_Dallyson (ATUALIZADO).xlsx"
+trainer = Trainer(PATH_YOLO, filename_tabela)
+trainer.train(epochs=10)
