@@ -88,11 +88,10 @@ class KAN_CNN(nn.Module):
 
 
 class ConvModule(nn.Module):
-    def __init__(self, num_classes):
+    def __init__(self):
         super(ConvModule, self).__init__()
 
         # Define the backbone CNN
-
         self.backbone = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
             nn.SELU(),
@@ -141,7 +140,7 @@ class Trainer:
         )
 
     def train(self, epochs=10, decay_step=7, lr_decay=0.1):
-        model = ConvModule(num_classes=2).to(self.device)
+        model = ConvModule().to(self.device)
         # fn_loss = BboxLoss()  # For classification tasks
         fn_loss = nn.MSELoss()
         optimizer = optim.Adam(model.parameters())
@@ -284,7 +283,7 @@ class MyDataset(Dataset):
         """
         Retorna imagem(tensor torch) e target(dict contendo tensores com bbox e classe)
         """
-        image = self.data[idx]
+        image = torch.tensor(self.data[idx], dtype=torch.float32)
         labels = torch.tensor(self.labels[idx], dtype=torch.float32)
         return image, labels
 
