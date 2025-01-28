@@ -1,3 +1,4 @@
+from multiprocessing import freeze_support
 import numpy as np
 import torch
 import torch.nn as nn
@@ -134,21 +135,22 @@ class Trainer:
         """
         self.device = torch.cuda.current_device()
         self.dataset = MyDataset(PATH_YOLO, filename_tabela)
-        print("DF MYDATASET: ", self.dataset.df)
+        # print("DF MYDATASET: ", self.dataset.df)
         self.DATALOADER = DataLoader(
-            self.dataset, batch_size=4, shuffle=True, num_workers=4
+            self.dataset, batch_size=4, shuffle=True, num_workers=0
         )
 
     def train(self, epochs=10, decay_step=7, lr_decay=0.1):
         model = ConvModule(num_classes=2).to(self.device)
         # fn_loss = BboxLoss()  # For classification tasks
         fn_loss = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters())
         lr_scheduler = optim.lr_scheduler.StepLR(
             optimizer, step_size=decay_step, gamma=lr_decay
         )
-        optimizer = optim.Adam(model.parameters())
 
         for epoch in range(epochs):  # Define the number of epochs
+            print(f"Epoch {epoch + 1} of {epochs}")
             model.train()
             for images, targets in self.DATALOADER:
                 # convertion to GPU tensor
@@ -283,11 +285,8 @@ class MyDataset(Dataset):
         Retorna imagem(tensor torch) e target(dict contendo tensores com bbox e classe)
         """
         image = self.data[idx]
-        boxes = torch.tensor(self.labels[idx]["bbox"], dtype=torch.float32)
-        labels = torch.tensor(self.labels[idx]["class"], dtype=torch.int16)
-        target = {"boxes": boxes, "classes": labels}
-
-        return image, target
+        labels = torch.tensor(self.labels[idx], dtype=torch.float32)
+        return image, labels
 
     def generate_data(self, PATH_YOLO):
         """
@@ -305,7 +304,7 @@ class MyDataset(Dataset):
             df.index = df.index.astype('<U16')
             dict_df[posicao] = df.dropna(how="any")
 
-            print(dict_df[posicao])
+            # print(dict_df[posicao])
         print("--------------------------------------\n\n")
 
         lista_dirs = ["train", "valid", "test"]
@@ -322,7 +321,7 @@ class MyDataset(Dataset):
 
                     arq = os.path.basename(
                         arq_imagem).replace(".JPG", "")
-                    print(arq)
+
                     splitado = os.path.basename(arq).split("-")
                     id = splitado[0]
                     pos = splitado[1]
@@ -331,13 +330,11 @@ class MyDataset(Dataset):
 
                     arq_imagem = os.path.join(images, arq_imagem)
                     id_format = str(int(id))
-                    print("ID: ", type(id_format), id_format)
-                    print("DF INDEX: ", dict_df[pos].index.to_list(),
-                          type(dict_df[pos].index.to_list()[10]), "\n")
 
+                    if id_format not in dict_df[pos].index.to_list():
+                        continue
                     entrada_df = dict_df[pos].loc[id_format]
-                    print("ENTRADA DF: \n", entrada_df, "\n\n")
-                    tupla_label = [f"{id_format}-{pos}",
+                    tupla_label = [f"{id}-{pos}",
                                    float(entrada_df["DH"]),
                                    float(entrada_df["DV"])]
 
@@ -359,7 +356,7 @@ class MyDataset(Dataset):
         lista_labels = sorted(
             lista_labels, key=lambda x: x[0]
         )
-        print("LABELS:", lista_labels)
+
         # cria tuplas pra inserir dentro do df
         tuplas_info = []
         for x in lista_img:
@@ -386,7 +383,6 @@ class MyDataset(Dataset):
                 path_img,
                 tupla_label[2:],
             ]
-            print(self.df.loc[indexer[ID, POSICAO], ["PATH", "LABEL"]])
         self.X = np.array(self.df.index.to_list())
         self.y = np.array(self.df["LABEL"].tolist())
 
@@ -439,8 +435,11 @@ if not os.path.exists(PATH_DATASET):
     else:
         raise SystemError("Dataset not found")
 
-PATH_YOLO = os.path.join(PATH_DATASET, "YOLO")
-filename_tabela = "DiagnosticoEspecialista_Tese_Dallyson (ATUALIZADO).xlsx"
-path_tabela = os.path.join(PATH_DATASET, filename_tabela)
-trainer = Trainer(PATH_YOLO, filename_tabela)
-trainer.train(epochs=10)
+
+if __name__ == '__main__':
+    PATH_YOLO = os.path.join(PATH_DATASET, "YOLO")
+    filename_tabela = "DiagnosticoEspecialista_Tese_Dallyson (ATUALIZADO).xlsx"
+    path_tabela = os.path.join(PATH_DATASET, filename_tabela)
+    trainer = Trainer(PATH_YOLO, filename_tabela)
+    freeze_support()
+    trainer.train(epochs=10)
