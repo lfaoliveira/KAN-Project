@@ -2,14 +2,12 @@ from multiprocessing import freeze_support
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Subset, DataLoader, Dataset
 import torch.optim as optim
 from torchvision.io import read_image
 import pandas as pd
 import os
-import sys
-import wandb
+import gc
 import shutil
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -90,16 +88,25 @@ class KAN_CNN(nn.Module):
 class ConvModule(nn.Module):
     def __init__(self):
         super(ConvModule, self).__init__()
-
+        self.INPUT_MLP = 1
+        # 2 numeros para a MLP
+        self.OUTPUT_MLP = 2
         # Define the backbone CNN
-        self.backbone = nn.Sequential(
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+        channel_out = [16, 32]
+        self.model = nn.Sequential(
+            # parte convolucional
+            nn.Conv2d(3, channel_out[0], kernel_size=3, stride=1, padding=1),
             nn.SELU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(channel_out[0], channel_out[1],
+                      kernel_size=3, stride=1, padding=1),
             nn.SELU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            # Add more layers as needed
+            nn.Flatten(),
+            # parte MLP
+            nn.LazyLinear(out_features=self.INPUT_MLP),
+            nn.SiLU(),
+            nn.LazyLinear(out_features=self.OUTPUT_MLP),
         )
 
         """ # Define the classifier head
@@ -114,12 +121,12 @@ class ConvModule(nn.Module):
         ) """
 
     def forward(self, x):
-        features = self.backbone(x)
+        out = self.model(x)
         # Flatten features for the heads
         # features = features.view(features.size(0), -1)
         # class_logits = self.classifier(in_features=features)
         # bbox_coords = self.bbox_regressor(in_features=features)
-        return features
+        return out
 
 
 class Trainer:
@@ -132,9 +139,16 @@ class Trainer:
         ``decay_step``: how many epochs to decay lr
         ``lr_decay``: factor for subtracting lr.
         """
-        self.device = torch.cuda.current_device()
-        self.dataset = MyDataset(PATH_YOLO, filename_tabela)
+        try:
+            self.device = torch.cuda.current_device()
+            print(f"DEVICE: {self.device}\n\n")
+        except:
+            self.device = torch.device("cpu")
+            print(f"DEVICE: CPU\n\n")
+
+        self.dataset = MyDataset(PATH_YOLO, filename_tabela, self.device)
         # print("DF MYDATASET: ", self.dataset.df)
+        num_workers = min(32, os.cpu_count() // 2)
         self.DATALOADER = DataLoader(
             self.dataset, batch_size=4, shuffle=True, num_workers=0
         )
@@ -149,7 +163,6 @@ class Trainer:
         )
 
         for epoch in range(epochs):  # Define the number of epochs
-            print(f"Epoch {epoch + 1} of {epochs}")
             model.train()
             for images, targets in self.DATALOADER:
                 # convertion to GPU tensor
@@ -158,12 +171,12 @@ class Trainer:
                 # Forward pass
                 optimizer.zero_grad()
                 estrabismo = model(images)
-                print(type(estrabismo, labels), estrabismo, labels)
+                # print(estrabismo, type(estrabismo), labels, type(labels))
                 loss = fn_loss(estrabismo, labels)
-
                 # Backward pass
                 loss.backward()
                 optimizer.step()
+            print(f"Epoch {epoch} of {epochs}")
             lr_scheduler.step()
 
 
@@ -248,25 +261,27 @@ class Metricas:
 
 
 class MyDataset(Dataset):
-    def __init__(self, PATH_YOLO, filename_tabela):
+    def __init__(self, PATH_YOLO, filename_tabela, device):
         # Store the data and labels
         self.POSICOES = ["PPO", "INFRA", "SUPRA", "LEVO", "DEXTRO"]
-
         self.path_tabela = os.path.join(PATH_DATASET, filename_tabela)
-
         self.inicializar_dataset(PATH_YOLO)
         df_dados = self.df
         lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
-        data = []
-        for path in lista_path_img:
-            data.append(read_image(path))
+        data = [read_image(path) for path in lista_path_img]
+
         # array com imagens
-        self.data = np.array(data)
+        self.data = torch.tensor(np.array(data), device=device)
+        print("DATA: ", self.data.shape)
 
         # lista contendo tuplas de estrabismo H e V
-        labels = list(df_dados.loc[:, "LABEL"].to_dict().values())
+        print("LABEL DF: ", type(
+            self.df.loc[:, "LABEL"]), self.df.loc[:, "LABEL"])
+        labels = df_dados.loc[:, "LABEL"].to_list()
         # array com classes e bboxes
-        self.labels = np.array(labels)
+        print(np.array(labels), np.array(labels).shape)
+        self.labels = torch.tensor(np.array(labels), device=device)
+        print("LABELS: ", self.labels.shape)
         assert len(self.labels) == len(self.data)
 
     def __len__(self):
@@ -380,7 +395,7 @@ class MyDataset(Dataset):
                 continue
             self.df.loc[indexer[ID, POSICAO], ["PATH", "LABEL"]] = [
                 path_img,
-                tupla_label[2:],
+                tupla_label[1:],
             ]
         self.X = np.array(self.df.index.to_list())
         self.y = np.array(self.df["LABEL"].tolist())
@@ -411,31 +426,35 @@ else:
     MODO = "LOCAL"
 # --SETTING PATH_DATASET-- #
 if MODO == "COLAB":
-    PATH_DATASET = os.path.join("/content", "datasets", "DATA_SET2")
+    PATH_DATASET = os.path.join("/content", "datasets")
 else:
     PATH_DATASET = os.path.join(os.getcwd(), "datasets")
 
 
-if not os.path.exists(PATH_DATASET):
-    if MODO != "LOCAL":
-        from google.colab.patches import cv2_imshow
-        from google.colab import drive
+if MODO != "LOCAL":
+    from google.colab.patches import cv2_imshow
+    from google.colab import drive
 
-        drive.mount("/content/drive")
+    drive.mount("/content/drive")
+    if not os.path.exists(os.path.join(PATH_DATASET, "SCRIPTS/")):
         shutil.copytree(
             "/content/drive/MyDrive/DATASETS DE SEGMENTAÇÃO/SCRIPTS/",
-            "/content/datasets/DATA_SET2/SCRIPTS/",
+            os.path.join(PATH_DATASET, "SCRIPTS/")
         )
+    if not os.path.exists(os.path.join(PATH_DATASET, "YOLO/")):
         shutil.copytree(
             "/content/drive/MyDrive/DATASETS DE SEGMENTAÇÃO/DADOS/YOLO",
-            "/content/datasets/DATA_SET2/YOLO",
+            os.path.join(PATH_DATASET, "YOLO/")
         )
     # raise error when dataset not present
-    else:
-        raise SystemError("Dataset not found")
+elif not os.path.exists(PATH_DATASET):
+    raise SystemError("Dataset not found")
 
 
 if __name__ == '__main__':
+    gc.collect()
+    torch.cuda.empty_cache()
+
     PATH_YOLO = os.path.join(PATH_DATASET, "YOLO")
     filename_tabela = "DiagnosticoEspecialista_Tese_Dallyson (ATUALIZADO).xlsx"
     path_tabela = os.path.join(PATH_DATASET, filename_tabela)
