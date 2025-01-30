@@ -1,10 +1,14 @@
+import pstats
+import cProfile
 from multiprocessing import freeze_support
+import time
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Subset, DataLoader, Dataset
 import torch.optim as optim
 from torchvision.io import read_image
+from torchvision.transforms.functional import resize
 import pandas as pd
 import os
 import gc
@@ -88,7 +92,7 @@ class KAN_CNN(nn.Module):
 class ConvModule(nn.Module):
     def __init__(self):
         super(ConvModule, self).__init__()
-        self.INPUT_MLP = 1
+        self.INPUT_MLP = 100
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
@@ -102,12 +106,13 @@ class ConvModule(nn.Module):
                       kernel_size=3, stride=1, padding=1),
             nn.SELU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Flatten(),
             # parte MLP
             nn.LazyLinear(out_features=self.INPUT_MLP),
-            nn.SiLU(),
             nn.LazyLinear(out_features=self.OUTPUT_MLP),
         )
+        torch.compile(self.model)
 
         """ # Define the classifier head
         self.classifier = nn.Sequential(
@@ -163,7 +168,10 @@ class Trainer:
         )
 
         for epoch in range(epochs):  # Define the number of epochs
+            gc.collect()
             model.train()
+            loss_epoch = 0
+            t1 = time.time()
             for images, targets in self.DATALOADER:
                 # convertion to GPU tensor
                 images = images.to(self.device)
@@ -175,8 +183,11 @@ class Trainer:
                 loss = fn_loss(estrabismo, labels)
                 # Backward pass
                 loss.backward()
+                # loss_epoch = np.mean(loss.detach().cpu().numpy())
                 optimizer.step()
-            print(f"Epoch {epoch} of {epochs}")
+            # print(f"Epoch {epoch} of {epochs}, LOSS(MSE): {loss_epoch}")
+            print(
+                f"Epoch {epoch + 1}/{epochs}. Time: {time.time() - t1} seconds")
             lr_scheduler.step()
 
 
@@ -268,10 +279,11 @@ class MyDataset(Dataset):
         self.inicializar_dataset(PATH_YOLO)
         df_dados = self.df
         lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
-        data = [read_image(path) for path in lista_path_img]
+        data = [resize(read_image(path), (512, 512))for path in lista_path_img]
 
         # array com imagens
-        self.data = torch.tensor(np.array(data), device=device)
+        self.data = torch.tensor(
+            np.array(data), device=device, dtype=torch.float32)
         print("DATA: ", self.data.shape)
 
         # lista contendo tuplas de estrabismo H e V
@@ -280,7 +292,8 @@ class MyDataset(Dataset):
         labels = df_dados.loc[:, "LABEL"].to_list()
         # array com classes e bboxes
         print(np.array(labels), np.array(labels).shape)
-        self.labels = torch.tensor(np.array(labels), device=device)
+        self.labels = torch.tensor(
+            np.array(labels), dtype=torch.float32, device=device)
         print("LABELS: ", self.labels.shape)
         assert len(self.labels) == len(self.data)
 
@@ -298,8 +311,11 @@ class MyDataset(Dataset):
         """
         Retorna imagem(tensor torch) e target(dict contendo tensores com bbox e classe)
         """
-        image = torch.tensor(self.data[idx], dtype=torch.float32)
-        labels = torch.tensor(self.labels[idx], dtype=torch.float32)
+        """ image = torch.tensor(self.data[idx], dtype=torch.float32)
+        labels = torch.tensor(self.labels[idx], dtype=torch.float32) """
+        image = self.data[idx]
+        labels = self.labels[idx]
+
         return image, labels
 
     def generate_data(self, PATH_YOLO):
@@ -454,10 +470,17 @@ elif not os.path.exists(PATH_DATASET):
 if __name__ == '__main__':
     gc.collect()
     torch.cuda.empty_cache()
+    print(torch.backends.cudnn.version())
 
     PATH_YOLO = os.path.join(PATH_DATASET, "YOLO")
     filename_tabela = "DiagnosticoEspecialista_Tese_Dallyson (ATUALIZADO).xlsx"
     path_tabela = os.path.join(PATH_DATASET, filename_tabela)
     trainer = Trainer(PATH_YOLO, filename_tabela)
     freeze_support()
-    trainer.train(epochs=10)
+    profiler = cProfile.Profile()
+    profiler.enable()
+    trainer.train(epochs=15)
+    profiler.disable()
+    stats = pstats.Stats(profiler)
+    stats.strip_dirs().sort_stats("tottime").print_stats(15)
+    # trainer.train(epochs=10)
