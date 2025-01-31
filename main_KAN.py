@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Subset, DataLoader, Dataset
 import torch.optim as optim
-from torchvision.io import read_image
+from torchvision.io import decode_image
 from torchvision.transforms.functional import resize
 import pandas as pd
 import os
@@ -89,6 +89,33 @@ class KAN_CNN(nn.Module):
         return x
 
 
+""" class BboxLoss(nn.Module):
+    '''Criterion class for computing training losses during training. Uses GIoU as a main loss'''
+
+    def __init__(self):
+        '''Initialize the BboxLoss module'''
+        super().__init__()
+
+    def forward(
+        self,
+        class_logits,
+        bbox_preds,
+        labels,
+        bbox_targets,
+    ):
+        '''IoU loss.
+        # weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        iou = Metricas.bbox_iou(
+            pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, GIoU=True
+        )
+        loss_iou = ((1.0 - iou)).sum() / target_scores_sum
+        '''
+        classification_loss = F.cross_entropy(class_logits, labels)
+        bbox_loss = F.smooth_l1_loss(bbox_preds, bbox_targets)
+        return classification_loss + bbox_loss
+ """
+
+
 class ConvModule(nn.Module):
     def __init__(self):
         super(ConvModule, self).__init__()
@@ -168,7 +195,6 @@ class Trainer:
         )
 
         for epoch in range(epochs):  # Define the number of epochs
-            gc.collect()
             model.train()
             loss_epoch = 0
             t1 = time.time()
@@ -183,39 +209,14 @@ class Trainer:
                 loss = fn_loss(estrabismo, labels)
                 # Backward pass
                 loss.backward()
-                # loss_epoch = np.mean(loss.detach().cpu().numpy())
+                loss_epoch = torch.mean(loss.detach())
                 optimizer.step()
-            # print(f"Epoch {epoch} of {epochs}, LOSS(MSE): {loss_epoch}")
-            print(
-                f"Epoch {epoch + 1}/{epochs}. Time: {time.time() - t1} seconds")
+            string_res = f"Epoch {epoch} of {epochs}, LOSS(MSE): {loss_epoch.flatten().cpu().item()}, Time: {time.time() - t1} seconds"
+            print(string_res)
             lr_scheduler.step()
 
-
-""" class BboxLoss(nn.Module):
-    '''Criterion class for computing training losses during training. Uses GIoU as a main loss'''
-
-    def __init__(self):
-        '''Initialize the BboxLoss module'''
-        super().__init__()
-
-    def forward(
-        self,
-        class_logits,
-        bbox_preds,
-        labels,
-        bbox_targets,
-    ):
-        '''IoU loss.
-        # weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = Metricas.bbox_iou(
-            pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, GIoU=True
-        )
-        loss_iou = ((1.0 - iou)).sum() / target_scores_sum
-        '''
-        classification_loss = F.cross_entropy(class_logits, labels)
-        bbox_loss = F.smooth_l1_loss(bbox_preds, bbox_targets)
-        return classification_loss + bbox_loss
- """
+        gc.collect()
+        return
 
 
 class Metricas:
@@ -277,23 +278,21 @@ class MyDataset(Dataset):
         self.POSICOES = ["PPO", "INFRA", "SUPRA", "LEVO", "DEXTRO"]
         self.path_tabela = os.path.join(PATH_DATASET, filename_tabela)
         self.inicializar_dataset(PATH_YOLO)
+        # TODO: criar logica de treino e validação com split de 70/30
         df_dados = self.df
         lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
-        data = [resize(read_image(path), (512, 512))for path in lista_path_img]
+        data = np.array([resize(decode_image(path), (512, 512))
+                        for path in lista_path_img], dtype=np.float32)
 
         # array com imagens
-        self.data = torch.tensor(
-            np.array(data), device=device, dtype=torch.float32)
+        self.data = torch.tensor(data, device=device, dtype=torch.float32)
         print("DATA: ", self.data.shape)
-
         # lista contendo tuplas de estrabismo H e V
-        print("LABEL DF: ", type(
-            self.df.loc[:, "LABEL"]), self.df.loc[:, "LABEL"])
+        print("LABEL DF: ", self.df.loc[:, "LABEL"])
         labels = df_dados.loc[:, "LABEL"].to_list()
         # array com classes e bboxes
         print(np.array(labels), np.array(labels).shape)
-        self.labels = torch.tensor(
-            np.array(labels), dtype=torch.float32, device=device)
+        self.labels = torch.tensor(labels, dtype=torch.float32, device=device)
         print("LABELS: ", self.labels.shape)
         assert len(self.labels) == len(self.data)
 
@@ -309,14 +308,12 @@ class MyDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-        Retorna imagem(tensor torch) e target(dict contendo tensores com bbox e classe)
+        Retorna imagem(tensor torch) e label(tensor torch)
         """
-        """ image = torch.tensor(self.data[idx], dtype=torch.float32)
-        labels = torch.tensor(self.labels[idx], dtype=torch.float32) """
         image = self.data[idx]
-        labels = self.labels[idx]
+        label = self.labels[idx]
 
-        return image, labels
+        return image, label
 
     def generate_data(self, PATH_YOLO):
         """
@@ -431,8 +428,8 @@ class MyDataset(Dataset):
             grupos[id].append(label) """
         return
 
-
 # -------------------------------------MAIN------------------------------------#
+
 
 # MODE LOCAL == running outside of Google Colab
 MODO = "LOCAL"
