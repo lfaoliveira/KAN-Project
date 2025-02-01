@@ -5,7 +5,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Subset, DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 import torch.optim as optim
 from torchvision.io import decode_image
 from torchvision.transforms.functional import resize
@@ -13,15 +13,20 @@ import pandas as pd
 import os
 import gc
 import shutil
+from sklearn.model_selection import GroupKFold, KFold
+from sklearn.model_selection import train_test_split
+
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 indexer = pd.IndexSlice
-
+RAND_STATE_GERAL = 42
 
 # ideia principal desse modelo é fazer deteccao da bounding box com as camadas convolucionais e depois calcular estrabismo
 # com regressão na KAN
+
+
 class KAN_CNN(nn.Module):
     def __init__(self, layers_hidden, polynomial_order=2, base_activation=nn.ReLU):
         super(KAN_CNN, self).__init__()
@@ -178,14 +183,25 @@ class Trainer:
             self.device = torch.device("cpu")
             print(f"DEVICE: CPU\n\n")
 
-        self.dataset = MyDataset(PATH_YOLO, filename_tabela, self.device)
-        # print("DF MYDATASET: ", self.dataset.df)
+        dataset = MyDataset(PATH_YOLO, filename_tabela, self.device)
+        data, labels = dataset.data.cpu().numpy(), dataset.labels.cpu().numpy()
+        X_train, X_test, y_train, y_test = train_test_split(
+            data, labels, test_size=0.30, random_state=42)
+
+        self.train_dataset = TensorDataset(
+            torch.tensor(X_train, device=self.device), torch.tensor(y_train, device=self.device))
+        self.val_dataset = TensorDataset(
+            torch.tensor(X_test, device=self.device), torch.tensor(y_test, device=self.device))
+
         num_workers = min(32, os.cpu_count() // 2)
-        self.DATALOADER = DataLoader(
-            self.dataset, batch_size=4, shuffle=True, num_workers=0
+        self.TRAIN_LOADER = DataLoader(
+            self.train_dataset, batch_size=4, shuffle=True, num_workers=0
+        )
+        self.VAL_LOADER = DataLoader(
+            self.val_dataset, batch_size=4, shuffle=False, num_workers=0
         )
 
-    def train(self, epochs=10, decay_step=7, lr_decay=0.1):
+    def train(self, epochs=10, decay_step=7, lr_decay=0.1, quant_folds=5):
         model = ConvModule().to(self.device)
         # fn_loss = BboxLoss()  # For classification tasks
         fn_loss = nn.MSELoss()
@@ -193,27 +209,57 @@ class Trainer:
         lr_scheduler = optim.lr_scheduler.StepLR(
             optimizer, step_size=decay_step, gamma=lr_decay
         )
+        threshold = 10
+        batch_size = 4
 
         for epoch in range(epochs):  # Define the number of epochs
             model.train()
-            loss_epoch = 0
             t1 = time.time()
-            for images, targets in self.DATALOADER:
+            loss_epoch = []
+            for image_batch, targets in self.TRAIN_LOADER:
                 # convertion to GPU tensor
-                images = images.to(self.device)
-                labels = targets.to(self.device)
+                image_batch = image_batch.to(self.device)
+                label_batch = targets.to(self.device)
+
                 # Forward pass
                 optimizer.zero_grad()
-                estrabismo = model(images)
-                # print(estrabismo, type(estrabismo), labels, type(labels))
-                loss = fn_loss(estrabismo, labels)
+                estrabismo = model(image_batch)
+                # print(estrabismo, type(estrabismo), label_batch, type(label_batch))
+                loss = fn_loss(estrabismo, label_batch)
+                loss_epoch.append(loss.detach())
+
                 # Backward pass
                 loss.backward()
-                loss_epoch = torch.mean(loss.detach())
                 optimizer.step()
-            string_res = f"Epoch {epoch} of {epochs}, LOSS(MSE): {loss_epoch.flatten().cpu().item()}, Time: {time.time() - t1} seconds"
+
+            loss_epoch = torch.stack(loss_epoch, dim=0)
+            string_res = f"Epoch {epoch} of {epochs}, LOSS(MSE): {loss_epoch.mean().cpu().item()}, Time: {time.time()-t1} seconds"
             print(string_res)
             lr_scheduler.step()
+
+        # Validation loop
+        model.eval()
+        y_true = []
+        y_pred = []
+        target_shape = (batch_size, 2)
+        with torch.no_grad():
+            for batch_X, batch_y in self.VAL_LOADER:
+                y_true.append(batch_y)
+                outputs = model(batch_X)
+                y_pred.append(outputs)
+
+                if batch_y.shape != y_true[0].shape:
+                    rows_to_add = target_shape[0] - batch_y.shape[0]
+                    last_row = batch_y[-1].unsqueeze(0).expand(rows_to_add, -1)
+                    batch_y = torch.cat([batch_y, last_row], dim=0)
+
+            y_true = torch.stack(y_true, dim=0)
+            y_pred = torch.stack(y_pred, dim=0)
+            val_prec, val_rec, val_f1 = Metricas.metricas_val(
+                y_true, y_pred, threshold)
+            print(f"PREC: {val_prec.cpu().item()}")
+            print(f"REC: {val_rec.cpu().item()}")
+            print(f"F1: {val_f1.cpu().item()}")
 
         gc.collect()
         return
@@ -222,6 +268,29 @@ class Trainer:
 class Metricas:
     def __init__(self):
         pass
+
+    @staticmethod
+    def metricas_val(y_true: torch.Tensor, y_pred: torch.Tensor, threshold: float):
+        abs_error = torch.sub(y_true - y_pred)
+        TP = torch.where(abs_error <= threshold, 1, 0)
+        FP = torch.where(abs_error > threshold, 0, 1)
+        FN = FP  # In regression, FP and FN are equivalent in this context
+
+        add = torch.add(TP, FP)
+        if add > 0:
+            precision = torch.divide(TP, add)
+        else:
+            precision = torch.tensor(0)
+        add = torch.add(TP, FN)
+        if add > 0:
+            recall = torch.divide(TP, add)
+        else:
+            recall = torch.tensor(0)
+        del add
+        f1 = torch.divide(torch.multiply(torch.tensor(
+            2), precision, recall), torch.add(precision, recall))
+
+        return precision.detach(), recall.detach(), f1.detach()
 
     @staticmethod
     def bbox_iou(box1, box2, xywh=True, GIoU=False, eps=1e-7):
@@ -291,7 +360,7 @@ class MyDataset(Dataset):
         print("LABEL DF: ", self.df.loc[:, "LABEL"])
         labels = df_dados.loc[:, "LABEL"].to_list()
         # array com classes e bboxes
-        print(np.array(labels), np.array(labels).shape)
+        # print(np.array(labels), np.array(labels).shape)
         self.labels = torch.tensor(labels, dtype=torch.float32, device=device)
         print("LABELS: ", self.labels.shape)
         assert len(self.labels) == len(self.data)
@@ -428,6 +497,7 @@ class MyDataset(Dataset):
             grupos[id].append(label) """
         return
 
+
 # -------------------------------------MAIN------------------------------------#
 
 
@@ -467,17 +537,12 @@ elif not os.path.exists(PATH_DATASET):
 if __name__ == '__main__':
     gc.collect()
     torch.cuda.empty_cache()
-    print(torch.backends.cudnn.version())
 
     PATH_YOLO = os.path.join(PATH_DATASET, "YOLO")
     filename_tabela = "DiagnosticoEspecialista_Tese_Dallyson (ATUALIZADO).xlsx"
     path_tabela = os.path.join(PATH_DATASET, filename_tabela)
     trainer = Trainer(PATH_YOLO, filename_tabela)
     freeze_support()
-    profiler = cProfile.Profile()
-    profiler.enable()
     trainer.train(epochs=15)
-    profiler.disable()
-    stats = pstats.Stats(profiler)
-    stats.strip_dirs().sort_stats("tottime").print_stats(15)
+
     # trainer.train(epochs=10)
