@@ -158,6 +158,7 @@ class ConvModule(nn.Module):
         ) """
 
     def forward(self, x):
+        x = resize(x, (512, 512))
         out = self.model(x)
         # Flatten features for the heads
         # features = features.view(features.size(0), -1)
@@ -184,7 +185,7 @@ class Trainer:
             print(f"DEVICE: CPU\n\n")
 
         dataset = MyDataset(PATH_YOLO, filename_tabela, self.device)
-        data, labels = dataset.data.cpu().numpy(), dataset.labels.cpu().numpy()
+        data, labels = dataset.data.numpy(True), dataset.labels.numpy(True)
         X_train, X_test, y_train, y_test = train_test_split(
             data, labels, test_size=0.30, random_state=42)
 
@@ -350,7 +351,7 @@ class MyDataset(Dataset):
         # TODO: criar logica de treino e validação com split de 70/30
         df_dados = self.df
         lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
-        data = np.array([resize(decode_image(path), (512, 512))
+        data = np.array([decode_image(path)
                         for path in lista_path_img], dtype=np.float32)
 
         # array com imagens
