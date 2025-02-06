@@ -5,7 +5,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
 import torch.optim as optim
 from torchvision.io import decode_image
 from torchvision.transforms.functional import resize
@@ -22,7 +22,8 @@ torch.backends.cudnn.allow_tf32 = True
 
 indexer = pd.IndexSlice
 RAND_STATE_GERAL = 42
-
+seed_pesos = 2
+torch.manual_seed(seed_pesos)
 # ideia principal desse modelo é fazer deteccao da bounding box com as camadas convolucionais e depois calcular estrabismo
 # com regressão na KAN
 
@@ -128,20 +129,24 @@ class ConvModule(nn.Module):
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
-        channel_out = [16, 32]
+        channel_out = [16, 32, 64]
         self.model = nn.Sequential(
             # parte convolucional
-            nn.Conv2d(3, channel_out[0], kernel_size=3, stride=1, padding=1),
-            nn.SELU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(3, channel_out[0], kernel_size=5, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=1),
             nn.Conv2d(channel_out[0], channel_out[1],
                       kernel_size=3, stride=1, padding=1),
-            nn.SELU(),
+            nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(channel_out[1], channel_out[2],
+                      kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Flatten(),
             # parte MLP
             nn.LazyLinear(out_features=self.INPUT_MLP),
+            nn.ReLU(),
             nn.LazyLinear(out_features=self.OUTPUT_MLP),
         )
         torch.compile(self.model)
@@ -158,7 +163,6 @@ class ConvModule(nn.Module):
         ) """
 
     def forward(self, x):
-        x = resize(x, (512, 512))
         out = self.model(x)
         # Flatten features for the heads
         # features = features.view(features.size(0), -1)
@@ -184,85 +188,105 @@ class Trainer:
             self.device = torch.device("cpu")
             print(f"DEVICE: CPU\n\n")
 
-        dataset = MyDataset(PATH_YOLO, filename_tabela, self.device)
-        data, labels = dataset.data.numpy(True), dataset.labels.numpy(True)
-        X_train, X_test, y_train, y_test = train_test_split(
-            data, labels, test_size=0.30, random_state=42)
+        self.dataset = MyDataset(PATH_YOLO, filename_tabela, self.device)
+        self.X = self.dataset.data.detach().cpu()
+        self.y = self.dataset.labels.detach().cpu()
+        self.quant_folds = 5
 
-        self.train_dataset = TensorDataset(
-            torch.tensor(X_train, device=self.device), torch.tensor(y_train, device=self.device))
-        self.val_dataset = TensorDataset(
-            torch.tensor(X_test, device=self.device), torch.tensor(y_test, device=self.device))
-
-        num_workers = min(32, os.cpu_count() // 2)
-        self.TRAIN_LOADER = DataLoader(
-            self.train_dataset, batch_size=4, shuffle=True, num_workers=0
-        )
-        self.VAL_LOADER = DataLoader(
-            self.val_dataset, batch_size=4, shuffle=False, num_workers=0
-        )
-
-    def train(self, epochs=10, decay_step=7, lr_decay=0.1, quant_folds=5):
+    def train(self, epochs=10, decay_step=7, lr_decay=1e-5, early_stop=10):
         model = ConvModule().to(self.device)
+        """ NOTE!!!!!!!!!!!!!!: Treinando modelo atualmente sem fazer transfer learning proprieamente dito """
         # fn_loss = BboxLoss()  # For classification tasks
         fn_loss = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters())
+        optimizer = optim.Adam(
+            model.parameters(), betas=(0.9, 0.99), lr=1e-2)
         lr_scheduler = optim.lr_scheduler.StepLR(
             optimizer, step_size=decay_step, gamma=lr_decay
         )
+        # variaveis auxiliares
         threshold = 10
-        batch_size = 4
+        best_f1 = 0
+        nochange = 0
+        # num_workers = min(32, os.cpu_count() // 2)     # usar so quando nao bugar
+        num_workers = 0
 
-        for epoch in range(epochs):  # Define the number of epochs
-            model.train()
-            t1 = time.time()
-            loss_epoch = []
-            for image_batch, targets in self.TRAIN_LOADER:
-                # convertion to GPU tensor
-                image_batch = image_batch.to(self.device)
-                label_batch = targets.to(self.device)
+        kfold = GroupKFold(
+            n_splits=self.quant_folds, shuffle=True, random_state=RAND_STATE_GERAL
+        )
 
-                # Forward pass
-                optimizer.zero_grad()
-                estrabismo = model(image_batch)
-                # print(estrabismo, type(estrabismo), label_batch, type(label_batch))
-                loss = fn_loss(estrabismo, label_batch)
-                loss_epoch.append(loss.detach())
+        self.batch_size = 8
+        num_exp = 0
 
-                # Backward pass
-                loss.backward()
-                optimizer.step()
+        for train_idx, val_idx in kfold.split(self.X, self.y, groups=self.dataset.grupos_pac):
+            print("-------------------------------")
+            print(f"EXPERIMENTO N° {num_exp}")
+            print("-------------------------------\n")
+            best_f1 = 0
+            nochange = 0
+            self.train_dataset = Subset(self.dataset, train_idx)
+            self.val_dataset = Subset(self.dataset, val_idx)
 
-            loss_epoch = torch.stack(loss_epoch, dim=0)
-            string_res = f"Epoch {epoch} of {epochs}, LOSS(MSE): {loss_epoch.mean().cpu().item()}, Time: {time.time()-t1} seconds"
-            print(string_res)
-            lr_scheduler.step()
+            self.TRAIN_LOADER = DataLoader(
+                self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers
+            )
+            self.VAL_LOADER = DataLoader(
+                self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers, drop_last=True
+            )
 
-        # Validation loop
-        model.eval()
-        y_true = []
-        y_pred = []
-        target_shape = (batch_size, 2)
-        with torch.no_grad():
-            for batch_X, batch_y in self.VAL_LOADER:
-                y_true.append(batch_y)
-                outputs = model(batch_X)
-                y_pred.append(outputs)
+            for epoch in range(epochs):  # Define the number of epochs
+                model.train()
+                t1 = time.time()
+                loss_epoch = []
+                for image_batch, targets in self.TRAIN_LOADER:
+                    # convertion to GPU tensor
+                    image_batch = image_batch.to(self.device)
+                    label_batch = targets.to(self.device)
 
-                if batch_y.shape != y_true[0].shape:
-                    rows_to_add = target_shape[0] - batch_y.shape[0]
-                    last_row = batch_y[-1].unsqueeze(0).expand(rows_to_add, -1)
-                    batch_y = torch.cat([batch_y, last_row], dim=0)
+                    # Forward pass
+                    optimizer.zero_grad()
+                    estrabismo = model(image_batch)
+                    loss = fn_loss(estrabismo, label_batch)
+                    loss_epoch.append(loss.detach())
 
-            y_true = torch.stack(y_true, dim=0)
-            y_pred = torch.stack(y_pred, dim=0)
-            val_prec, val_rec, val_f1 = Metricas.metricas_val(
-                y_true, y_pred, threshold)
-            print(f"PREC: {val_prec.cpu().item()}")
-            print(f"REC: {val_rec.cpu().item()}")
-            print(f"F1: {val_f1.cpu().item()}")
+                    # Backward pass
+                    loss.backward()
+                    optimizer.step()
 
-        gc.collect()
+                loss_epoch = torch.stack(loss_epoch, dim=0)
+                string_res = f"Epoch {epoch} of {epochs}, \
+                    LOSS(MSE): {round(loss_epoch.mean().cpu().item(), 3)},  \
+                    Time: {round(time.time()-t1, 2)} seconds"
+
+                print(string_res)
+                lr_scheduler.step()
+
+                # Validation loop
+                model.eval()
+                y_true = []
+                y_pred = []
+                with torch.no_grad():
+                    for batch_X, batch_y in self.VAL_LOADER:
+                        y_true.append(batch_y)
+                        outputs = model(batch_X)
+                        y_pred.append(outputs)
+
+                    y_true = torch.stack(y_true, dim=0)
+                    y_pred = torch.stack(y_pred, dim=0)
+                    val_prec, val_rec, val_f1, MAE, DP = Metricas.metricas_val(
+                        y_true, y_pred, threshold)
+
+                    res = f"MAE: {round(MAE, 1)} DP: {round(DP, 1)} PREC: {val_prec} REC: {val_rec} F1: {val_f1}\n"
+                    print(res)
+
+                    if val_f1 != torch.nan and val_f1 > best_f1:
+                        best_f1 = val_f1
+                        nochange = 0
+                    else:
+                        nochange += 1
+                        if nochange > early_stop:
+                            break
+            num_exp += 1
+            gc.collect()
         return
 
 
@@ -272,26 +296,38 @@ class Metricas:
 
     @staticmethod
     def metricas_val(y_true: torch.Tensor, y_pred: torch.Tensor, threshold: float):
-        abs_error = torch.sub(y_true - y_pred)
-        TP = torch.where(abs_error <= threshold, 1, 0)
-        FP = torch.where(abs_error > threshold, 0, 1)
-        FN = FP  # In regression, FP and FN are equivalent in this context
-
+        abs_error = torch.abs(torch.sub(y_true, y_pred))
+        MAE = torch.mean(abs_error)
+        DP_ERRO = torch.std(abs_error)
+        TP = torch.count_nonzero(torch.where(abs_error <= threshold, 1, 0))
+        # print(TP)
+        # FP = torch.count_nonzero(torch.where(abs_error > threshold, 0, 1))
+        FP = torch.tensor(abs_error.nelement()) - TP
+        # print(FP)
+        # FN = FP  In regression, FP and FN are equivalent in this context
         add = torch.add(TP, FP)
+        # print(add)
         if add > 0:
             precision = torch.divide(TP, add)
         else:
             precision = torch.tensor(0)
-        add = torch.add(TP, FN)
+
         if add > 0:
             recall = torch.divide(TP, add)
         else:
             recall = torch.tensor(0)
         del add
-        f1 = torch.divide(torch.multiply(torch.tensor(
-            2), precision, recall), torch.add(precision, recall))
 
-        return precision.detach(), recall.detach(), f1.detach()
+        f1 = torch.divide(torch.multiply(
+            2*precision, recall), torch.add(precision, recall))
+
+        precision = precision.detach().cpu().item()
+        recall = recall.detach().cpu().item()
+        f1 = f1.detach().cpu().item()
+        MAE = MAE.detach().cpu().item()
+        DP_ERRO = DP_ERRO.detach().cpu().item()
+
+        return precision, recall, f1, MAE, DP_ERRO
 
     @staticmethod
     def bbox_iou(box1, box2, xywh=True, GIoU=False, eps=1e-7):
@@ -351,7 +387,7 @@ class MyDataset(Dataset):
         # TODO: criar logica de treino e validação com split de 70/30
         df_dados = self.df
         lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
-        data = np.array([decode_image(path)
+        data = np.array([resize(decode_image(path), (512, 512))
                         for path in lista_path_img], dtype=np.float32)
 
         # array com imagens
@@ -480,22 +516,13 @@ class MyDataset(Dataset):
                 path_img,
                 tupla_label[1:],
             ]
-        self.X = np.array(self.df.index.to_list())
-        self.y = np.array(self.df["LABEL"].tolist())
+        """ self.X = np.array(self.df.index.to_list())
+        self.y = np.array(self.df["LABEL"].tolist()) """
 
         # utiliza id de paciente como id para grupo
         # apenas usar em cross-validation.
-        # self.grupos_pac = self.df.index.get_level_values(0).tolist()
+        self.grupos_pac = self.df.index.get_level_values(0).tolist()
 
-        """path_out = "out.csv"
-        if os.path.exists(path_out):
-            os.remove(path_out)
-        self.df.to_csv(path_out, index=True)"""
-
-        """
-        for tupla, label in zip(X, y):
-            id = tupla[0]
-            grupos[id].append(label) """
         return
 
 
@@ -544,6 +571,6 @@ if __name__ == '__main__':
     path_tabela = os.path.join(PATH_DATASET, filename_tabela)
     trainer = Trainer(PATH_YOLO, filename_tabela)
     freeze_support()
-    trainer.train(epochs=15)
+    trainer.train(epochs=100, early_stop=10)
 
     # trainer.train(epochs=10)
