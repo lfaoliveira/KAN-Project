@@ -8,3 +8,5 @@ dependencies:
   - pip
   - pip:
     - -r requirements.txt
+  - numpy<3
+  - pandas>2.2
