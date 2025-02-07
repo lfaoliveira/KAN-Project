@@ -15,6 +15,7 @@ import gc
 import shutil
 from sklearn.model_selection import GroupKFold, KFold
 from sklearn.model_selection import train_test_split
+from pykan import KAN
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -22,7 +23,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 indexer = pd.IndexSlice
 RAND_STATE_GERAL = 42
-seed_pesos = 2
+seed_pesos = 3
 torch.manual_seed(seed_pesos)
 # ideia principal desse modelo é fazer deteccao da bounding box com as camadas convolucionais e depois calcular estrabismo
 # com regressão na KAN
@@ -214,7 +215,7 @@ class Trainer:
             """ NOTE!!!!!!!!!!!!!!: Treinando modelo atualmente sem fazer transfer learning proprieamente dito """
 
             optimizer = optim.Adam(
-                model.parameters(), betas=(0.9, 0.99), lr=1e-2)
+                model.parameters(), weight_decay=1e-2, betas=(0.9, 0.99), lr=1e-2)
             lr_scheduler = optim.lr_scheduler.StepLR(
                 optimizer, step_size=decay_step, gamma=lr_decay
             )
