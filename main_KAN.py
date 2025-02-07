@@ -39,16 +39,6 @@ class KAN_CNN(nn.Module):
         self.base_activation = base_activation()
 
         # Feature extractor with Convolutional layers
-        self.feature_extractor = nn.Sequential(
-            nn.Conv2d(
-                1, 16, kernel_size=3, stride=1, padding=1
-            ),  # 1 input channel (grayscale), 16 output channels
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2),
-        )
 
         # Calculate the flattened feature size after convolutional layers
         flat_features = 32 * 7 * 7
@@ -194,21 +184,16 @@ class Trainer:
         self.quant_folds = 5
 
     def train(self, epochs=10, decay_step=7, lr_decay=1e-5, early_stop=10):
-        model = ConvModule().to(self.device)
-        """ NOTE!!!!!!!!!!!!!!: Treinando modelo atualmente sem fazer transfer learning proprieamente dito """
+
         # fn_loss = BboxLoss()  # For classification tasks
         fn_loss = nn.MSELoss()
-        optimizer = optim.Adam(
-            model.parameters(), betas=(0.9, 0.99), lr=1e-2)
-        lr_scheduler = optim.lr_scheduler.StepLR(
-            optimizer, step_size=decay_step, gamma=lr_decay
-        )
         # variaveis auxiliares
         threshold = 10
         best_f1 = 0
         nochange = 0
         # num_workers = min(32, os.cpu_count() // 2)     # usar so quando nao bugar
         num_workers = 0
+        results = []
 
         kfold = GroupKFold(
             n_splits=self.quant_folds, shuffle=True, random_state=RAND_STATE_GERAL
@@ -221,6 +206,19 @@ class Trainer:
             print("-------------------------------")
             print(f"EXPERIMENTO N° {num_exp}")
             print("-------------------------------\n")
+
+            model = ConvModule().to(self.device)
+            # dry run pra inicializar LazyModules
+            # shape: (Batch, Canais, Height, Width)
+            model(torch.ones(size=(1, 3, 512, 512)).to(self.device))
+            """ NOTE!!!!!!!!!!!!!!: Treinando modelo atualmente sem fazer transfer learning proprieamente dito """
+
+            optimizer = optim.Adam(
+                model.parameters(), betas=(0.9, 0.99), lr=1e-2)
+            lr_scheduler = optim.lr_scheduler.StepLR(
+                optimizer, step_size=decay_step, gamma=lr_decay
+            )
+
             best_f1 = 0
             nochange = 0
             self.train_dataset = Subset(self.dataset, train_idx)
@@ -253,8 +251,9 @@ class Trainer:
                     optimizer.step()
 
                 loss_epoch = torch.stack(loss_epoch, dim=0)
+                loss_mean = loss_epoch.mean().cpu().item()
                 string_res = f"Epoch {epoch} of {epochs}, \
-                    LOSS(MSE): {round(loss_epoch.mean().cpu().item(), 3)},  \
+                    LOSS(MSE): {round(loss_mean, 3)},  \
                     Time: {round(time.time()-t1, 2)} seconds"
 
                 print(string_res)
@@ -278,6 +277,18 @@ class Trainer:
                     res = f"MAE: {round(MAE, 1)} DP: {round(DP, 1)} PREC: {val_prec} REC: {val_rec} F1: {val_f1}\n"
                     print(res)
 
+                    results.append({
+                        "experiment": num_exp,
+                        "epoch": epoch,
+                        "loss": round(loss_mean, 3),
+                        "MAE": round(MAE, 1),
+                        "DP": round(DP, 1),
+                        "Precision": val_prec,
+                        "Recall": val_rec,
+                        "F1-score": val_f1,
+                        "time": round(time.time() - t1, 2)
+                    })
+
                     if val_f1 != torch.nan and val_f1 > best_f1:
                         best_f1 = val_f1
                         nochange = 0
@@ -287,6 +298,10 @@ class Trainer:
                             break
             num_exp += 1
             gc.collect()
+
+        results_df = pd.DataFrame(results)
+        # results_df.to_csv("training_results.csv", index=False)  # Save to CSV
+        print("Results:", results_df)
         return
 
 
@@ -574,3 +589,10 @@ if __name__ == '__main__':
     trainer.train(epochs=100, early_stop=10)
 
     # trainer.train(epochs=10)
+
+m = nn.GLU()
+input = torch.randn(4, 2)
+print(input)
+output = m(input)
+
+print(f"\n\n {output}")
