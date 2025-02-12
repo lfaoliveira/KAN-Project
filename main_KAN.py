@@ -30,9 +30,30 @@ torch.manual_seed(seed_pesos)
 class Conv_KAN(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.INPUT_MLP = 100
+        # 2 numeros para a MLP
+        self.OUTPUT_MLP = 2
+        # Define the backbone CNN
+        channel_out = [16, 32, 64]
+
         self.model = nn.Sequential(
-            ConvModule(),
-            KAN(width=[10, 10, 10], grid=6, k=5, symbolic_enabled=False))
+            # parte convolucional
+            nn.Conv2d(3, channel_out[0], kernel_size=5, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=1),
+            nn.Conv2d(channel_out[0], channel_out[1],
+                      kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(channel_out[1], channel_out[2],
+                      kernel_size=3, stride=1, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Flatten(),
+            KAN(width=[10, 10, 2], grid=12, k=5, symbolic_enabled=False),
+            KAN(width=[10, 10, 2], grid=12, k=5, symbolic_enabled=False)
+        )
+        self.model = torch.compile(self.model)
 
     def forward(self, x):
         return self.model(x)
@@ -92,7 +113,7 @@ class ConvModule(nn.Module):
             nn.ReLU(),
             nn.LazyLinear(out_features=self.OUTPUT_MLP),
         )
-        torch.compile(self.model)
+        self.model = torch.compile(self.model)
 
         """ # Define the classifier head
         self.classifier = nn.Sequential(
@@ -136,7 +157,7 @@ class Trainer:
         self.y = self.dataset.labels.detach().cpu()
         self.quant_folds = 5
 
-    def train(self, epochs=10, decay_step=7, lr_decay=1e-5, early_stop=10):
+    def train(self, epochs=10, decay_step=7, lr_decay=1e-5, early_stop=10, warmup=5):
 
         # fn_loss = BboxLoss()  # For classification tasks
         fn_loss = nn.MSELoss()
@@ -160,7 +181,7 @@ class Trainer:
             print(f"EXPERIMENTO N° {num_exp}")
             print("-------------------------------\n")
 
-            model = ConvModule().to(self.device)
+            model = Conv_KAN().to(self.device)
             # dry run pra inicializar LazyModules
             # shape: (Batch, Canais, Height, Width)
             model(torch.ones(size=(1, 3, 512, 512)).to(self.device))
@@ -247,7 +268,7 @@ class Trainer:
                         nochange = 0
                     else:
                         nochange += 1
-                        if nochange > early_stop:
+                        if nochange > early_stop + warmup:
                             break
             num_exp += 1
             gc.collect()
@@ -495,8 +516,6 @@ class MyDataset(Dataset):
 
 
 # -------------------------------------MAIN------------------------------------#
-
-
 # MODE LOCAL == running outside of Google Colab
 MODO = "LOCAL"
 if os.path.exists("/content"):
@@ -540,12 +559,4 @@ if __name__ == '__main__':
     trainer = Trainer(PATH_YOLO, filename_tabela)
     freeze_support()
     trainer.train(epochs=100, early_stop=10)
-
     # trainer.train(epochs=10)
-
-m = nn.GLU()
-input = torch.randn(4, 2)
-print(input)
-output = m(input)
-
-print(f"\n\n {output}")
