@@ -10,7 +10,6 @@ The project consists of training a Convolutional feature extractor and Kolmogoro
 
 # Run instructions:
 `conda env create -f environment.yaml`
-`pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124`
 `conda activate strabismus_KAN`
 
 

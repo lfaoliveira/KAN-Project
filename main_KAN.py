@@ -3,7 +3,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset
+from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset, SubsetRandomSampler
 import torch.optim as optim
 from torchvision.io import decode_image
 from torchvision.transforms.functional import resize
@@ -13,6 +13,8 @@ import gc
 import shutil
 from sklearn.model_selection import GroupKFold, KFold
 from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
+import matplotlib.image as mpimg
 from kan import KAN
 
 
@@ -50,9 +52,12 @@ class Conv_KAN(nn.Module):
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Flatten(),
-            KAN(width=[10, 10, 2], grid=12, k=5, symbolic_enabled=False),
+            KAN(width=[10, 10, 10], grid=12, k=5, symbolic_enabled=False),
+            nn.Dropout(p=0.5),
+            KAN(width=[10, 10, 10], grid=12, k=5, symbolic_enabled=False),
             KAN(width=[10, 10, 2], grid=12, k=5, symbolic_enabled=False)
         )
+
         self.model = torch.compile(self.model)
 
     def forward(self, x):
@@ -181,6 +186,8 @@ class Trainer:
             print(f"EXPERIMENTO N° {num_exp}")
             print("-------------------------------\n")
 
+            results_exp = {}
+
             model = Conv_KAN().to(self.device)
             # dry run pra inicializar LazyModules
             # shape: (Batch, Canais, Height, Width)
@@ -188,7 +195,7 @@ class Trainer:
             """ NOTE!!!!!!!!!!!!!!: Treinando modelo atualmente sem fazer transfer learning proprieamente dito """
 
             optimizer = optim.Adam(
-                model.parameters(), weight_decay=1e-2, betas=(0.9, 0.99), lr=1e-2)
+                model.parameters(), weight_decay=1e-10, betas=(0.9, 0.99), lr=1e-2)
             lr_scheduler = optim.lr_scheduler.StepLR(
                 optimizer, step_size=decay_step, gamma=lr_decay
             )
@@ -197,6 +204,11 @@ class Trainer:
             nochange = 0
             self.train_dataset = Subset(self.dataset, train_idx)
             self.val_dataset = Subset(self.dataset, val_idx)
+            path_imgs = np.array(self.val_dataset.dataset.lista_path_img)
+            names = [
+                os.path.basename(elem) for elem in path_imgs[val_idx]]
+
+            print(names)
 
             self.TRAIN_LOADER = DataLoader(
                 self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers
@@ -226,9 +238,10 @@ class Trainer:
 
                 loss_epoch = torch.stack(loss_epoch, dim=0)
                 loss_mean = loss_epoch.mean().cpu().item()
+                temp_batch = round(time.time() - t1, 2)
                 string_res = f"Epoch {epoch} of {epochs}, \
                     LOSS(MSE): {round(loss_mean, 3)},  \
-                    Time: {round(time.time()-t1, 2)} seconds"
+                    Time: {temp_batch} seconds"
 
                 print(string_res)
                 lr_scheduler.step()
@@ -248,19 +261,19 @@ class Trainer:
                     val_prec, val_rec, val_f1, MAE, DP = Metricas.metricas_val(
                         y_true, y_pred, threshold)
 
-                    res = f"MAE: {round(MAE, 1)} DP: {round(DP, 1)} PREC: {val_prec} REC: {val_rec} F1: {val_f1}\n"
+                    res = f"MAE: {MAE} DP: {DP} PREC: {val_prec} REC: {val_rec} F1: {val_f1}\n"
                     print(res)
-
+                    temp_total = round(time.time() - t1, 2)
                     results.append({
                         "experiment": num_exp,
                         "epoch": epoch,
                         "loss": round(loss_mean, 3),
-                        "MAE": round(MAE, 1),
-                        "DP": round(DP, 1),
+                        "MAE": MAE,
+                        "DP": DP,
                         "Precision": val_prec,
                         "Recall": val_rec,
                         "F1-score": val_f1,
-                        "time": round(time.time() - t1, 2)
+                        "time": temp_total
                     })
 
                     if val_f1 != torch.nan and val_f1 > best_f1:
@@ -270,12 +283,33 @@ class Trainer:
                         nochange += 1
                         if nochange > early_stop + warmup:
                             break
+            # salvando performance final do modelo
+            model.eval()
+            y_true = []
+            y_pred = []
+            imgs = []
+            with torch.no_grad():
+                for batch_X, batch_y in self.VAL_LOADER:
+                    imgs.append(batch_X)
+                    y_true.append(batch_y)
+                    outputs = model(batch_X)
+                    y_pred.append(outputs)
+
+                tensor_imgs = torch.cat(imgs, dim=0)
+                y_true = torch.cat(y_true, dim=0)
+                y_pred = torch.cat(y_pred, dim=0)
+                plot_image_with_number(tensor_imgs, y_true, y_pred, names)
+            # fim eval
+
             num_exp += 1
+            del model
             gc.collect()
+            torch.cuda.empty_cache()
 
         results_df = pd.DataFrame(results)
-        # results_df.to_csv("training_results.csv", index=False)  # Save to CSV
-        print("Results:", results_df)
+        results_df.to_csv("training_results_cross.csv",
+                          index=False)  # Save to CSV
+        # print("Results:", results_df)
         return
 
 
@@ -310,11 +344,11 @@ class Metricas:
         f1 = torch.divide(torch.multiply(
             2*precision, recall), torch.add(precision, recall))
 
-        precision = precision.detach().cpu().item()
-        recall = recall.detach().cpu().item()
-        f1 = f1.detach().cpu().item()
-        MAE = MAE.detach().cpu().item()
-        DP_ERRO = DP_ERRO.detach().cpu().item()
+        precision = precision.detach().round(decimals=2).cpu().item()
+        recall = recall.detach().round(decimals=2).cpu().item()
+        f1 = f1.detach().round(decimals=2).cpu().item()
+        MAE = MAE.detach().round(decimals=2).cpu().item()
+        DP_ERRO = DP_ERRO.detach().round(decimals=2).cpu().item()
 
         return precision, recall, f1, MAE, DP_ERRO
 
@@ -375,9 +409,9 @@ class MyDataset(Dataset):
         self.inicializar_dataset(PATH_YOLO)
         # TODO: criar logica de treino e validação com split de 70/30
         df_dados = self.df
-        lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
+        self.lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
         data = np.array([resize(decode_image(path), (512, 512))
-                        for path in lista_path_img], dtype=np.float32)
+                        for path in self.lista_path_img], dtype=np.float32)
 
         # array com imagens
         self.data = torch.tensor(data, device=device, dtype=torch.float32)
@@ -395,19 +429,12 @@ class MyDataset(Dataset):
         # Total number of samples
         return len(self.data)
 
-    """def __getitem__(self, idx):
-        # Fetch the data and label at the given index
-        sample = self.data[idx]
-        label = self.labels[idx]
-        return sample, label """
-
     def __getitem__(self, idx):
         """
         Retorna imagem(tensor torch) e label(tensor torch)
         """
         image = self.data[idx]
         label = self.labels[idx]
-
         return image, label
 
     def generate_data(self, PATH_YOLO):
@@ -513,6 +540,56 @@ class MyDataset(Dataset):
         self.grupos_pac = self.df.index.get_level_values(0).tolist()
 
         return
+
+
+def plot_image_with_number(tensor_imgs: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor, names):
+    """
+    Displays an image with a number caption below it.
+    Parameters:
+    - tensor_imgs: torch tensors containing one image each entry
+    - y_true: torch tensors containing strabismus labels
+    - y_pred: torch tensors containing strabismus predictions
+    """
+
+    # iterates idx over batch size
+    for idx in range(tensor_imgs.shape[0]):
+        img = tensor_imgs[idx].numpy(force=True).transpose(1, 2, 0) / 255
+        label = y_true[idx].numpy(force=True)
+        pred = y_pred[idx].numpy(force=True)
+
+        path_out = f"{os.path.splitext(names[idx])[0]}_OUTPUT.jpg"
+        # Create a figure and axis
+        fig, ax = plt.subplots()
+        # Display the image
+        ax.imshow(img)
+        ax.axis('off')  # Hide the axes
+        # Add the number below the image
+        str_estrab = f"PRED:{pred}, LABEL:{label}"
+        plt.figtext(0.5, 0.01, str_estrab, ha='center', fontsize=12)
+        fig.savefig(path_out)
+        # Show the plot
+        print("\n")
+        plt.show()
+
+    """ img = mpimg.imread(image_path)
+    sp = os.path.splitext(image_path)
+    path_out = f"{sp[0]}_OUTPUT.{sp[1]}"
+
+    # Create a figure and axis
+    fig, ax = plt.subplots()
+
+    # Display the image
+    ax.imshow(img)
+    ax.axis('off')  # Hide the axes
+
+    # Add the number below the image
+    pred = estrab[0]
+    label = estrab[1]
+    str_estrab = f"PRED:{pred}, LABEL:{label}"
+    plt.figtext(0.5, 0.01, str_estrab, ha='center', fontsize=12)
+    plt.savefig(path_out)
+    # Show the plot
+    plt.show() """
 
 
 # -------------------------------------MAIN------------------------------------#
