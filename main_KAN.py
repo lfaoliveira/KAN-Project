@@ -121,6 +121,7 @@ class ConvModule(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Conv2d(channel_out[1], channel_out[2],
                       kernel_size=3, stride=1, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Flatten(),
@@ -436,7 +437,6 @@ class MyDataset(Dataset):
         self.POSICOES = ["PPO", "INFRA", "SUPRA", "LEVO", "DEXTRO"]
         self.path_tabela = os.path.join(PATH_DATASET, filename_tabela)
         self.inicializar_dataset(PATH_YOLO)
-        # TODO: criar logica de treino e validação com split de 70/30
         df_dados = self.df
         self.lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
         data = np.array([resize(decode_image(path), (512, 512))
