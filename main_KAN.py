@@ -36,10 +36,9 @@ class Conv_KAN(nn.Module):
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
-        channel_out = [16, 32, 64]
-
-        self.model = nn.Sequential(
-            # parte convolucional
+        channel_out = [16, 32, 32]
+        # parte convolucional
+        self.conv = nn.Sequential(
             nn.Conv2d(3, channel_out[0], kernel_size=5, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=1),
@@ -49,19 +48,31 @@ class Conv_KAN(nn.Module):
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.Conv2d(channel_out[1], channel_out[2],
                       kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2)
+        )
+        self.model = nn.Sequential(
+            self.conv,
             nn.Flatten(),
             KAN(width=[10, 10, 10], grid=12, k=5, symbolic_enabled=False),
-            nn.Dropout(p=0.5),
+            # nn.Dropout(p=0.5),
             KAN(width=[10, 10, 10], grid=12, k=5, symbolic_enabled=False),
             KAN(width=[10, 10, 2], grid=12, k=5, symbolic_enabled=False)
         )
 
+        self.activations = {}
+        self._modules.get("conv").register_forward_hook(
+            self.save_activation("conv"))
         self.model = torch.compile(self.model)
 
     def forward(self, x):
         return self.model(x)
+
+    def save_activation(self, name):
+        def hook(module, input, output):
+            self.activations[name] = output.detach()
+        return hook
 
 
 """ class BboxLoss(nn.Module):
@@ -162,12 +173,12 @@ class Trainer:
         self.y = self.dataset.labels.detach().cpu()
         self.quant_folds = 5
 
-    def train(self, epochs=10, decay_step=7, lr_decay=1e-5, early_stop=10, warmup=5):
+    def train(self, epochs=100, decay_step=7, lr_decay=1e-5, early_stop=10, warmup=5):
 
         # fn_loss = BboxLoss()  # For classification tasks
         fn_loss = nn.MSELoss()
         # variaveis auxiliares
-        threshold = 10
+        self.threshold = 10
         best_f1 = 0
         nochange = 0
         # num_workers = min(32, os.cpu_count() // 2)     # usar so quando nao bugar
@@ -237,7 +248,7 @@ class Trainer:
                     optimizer.step()
 
                 loss_epoch = torch.stack(loss_epoch, dim=0)
-                loss_mean = loss_epoch.mean().cpu().item()
+                loss_mean = loss_epoch.mean().numpy(force=True).item()
                 temp_batch = round(time.time() - t1, 2)
                 string_res = f"Epoch {epoch} of {epochs}, \
                     LOSS(MSE): {round(loss_mean, 3)},  \
@@ -245,60 +256,42 @@ class Trainer:
 
                 print(string_res)
                 lr_scheduler.step()
+                kwargs = {
+                    "epoch": epoch, "loss_mean": loss_mean, "t1": t1}
+                val_f1 = self.avaliar(model, results, num_exp, **kwargs)
 
-                # Validation loop
-                model.eval()
-                y_true = []
-                y_pred = []
-                with torch.no_grad():
-                    for batch_X, batch_y in self.VAL_LOADER:
-                        y_true.append(batch_y)
-                        outputs = model(batch_X)
-                        y_pred.append(outputs)
+                if val_f1 != torch.nan and val_f1 > best_f1:
+                    best_f1 = val_f1
+                    nochange = 0
+                else:
+                    nochange += 1
+                    if nochange > early_stop + warmup:
+                        break
 
-                    y_true = torch.stack(y_true, dim=0)
-                    y_pred = torch.stack(y_pred, dim=0)
-                    val_prec, val_rec, val_f1, MAE, DP = Metricas.metricas_val(
-                        y_true, y_pred, threshold)
-
-                    res = f"MAE: {MAE} DP: {DP} PREC: {val_prec} REC: {val_rec} F1: {val_f1}\n"
-                    print(res)
-                    temp_total = round(time.time() - t1, 2)
-                    results.append({
-                        "experiment": num_exp,
-                        "epoch": epoch,
-                        "loss": round(loss_mean, 3),
-                        "MAE": MAE,
-                        "DP": DP,
-                        "Precision": val_prec,
-                        "Recall": val_rec,
-                        "F1-score": val_f1,
-                        "time": temp_total
-                    })
-
-                    if val_f1 != torch.nan and val_f1 > best_f1:
-                        best_f1 = val_f1
-                        nochange = 0
-                    else:
-                        nochange += 1
-                        if nochange > early_stop + warmup:
-                            break
             # salvando performance final do modelo
             model.eval()
             y_true = []
             y_pred = []
             imgs = []
+            ativacoes = []
             with torch.no_grad():
                 for batch_X, batch_y in self.VAL_LOADER:
                     imgs.append(batch_X)
                     y_true.append(batch_y)
                     outputs = model(batch_X)
+                    act = model.activations['conv'].squeeze()
+                    ativacoes.append(act)
                     y_pred.append(outputs)
 
                 tensor_imgs = torch.cat(imgs, dim=0)
                 y_true = torch.cat(y_true, dim=0)
                 y_pred = torch.cat(y_pred, dim=0)
-                plot_image_with_number(tensor_imgs, y_true, y_pred, names)
+                dir_save = os.path.join(os.getcwd(), f"EXP {num_exp}")
+                os.makedirs(dir_save, exist_ok=True)
+                plot_image_with_number(
+                    tensor_imgs, y_true, y_pred, names, save_dir=dir_save)
+                ativacoes = torch.cat(ativacoes)
+                plot_ativ(ativacoes)
             # fim eval
 
             num_exp += 1
@@ -311,6 +304,42 @@ class Trainer:
                           index=False)  # Save to CSV
         # print("Results:", results_df)
         return
+
+    def avaliar(self, model, results, num_exp, **kwargs):
+        epoch = kwargs.get('epoch', None)
+        loss_mean = kwargs.get('loss_mean', None)
+        t1 = kwargs.get('t1', None)
+        # Validation loop
+        model.eval()
+        y_true = []
+        y_pred = []
+        with torch.no_grad():
+            for batch_X, batch_y in self.VAL_LOADER:
+                y_true.append(batch_y)
+                outputs = model(batch_X)
+                y_pred.append(outputs)
+
+            y_true = torch.stack(y_true, dim=0)
+            y_pred = torch.stack(y_pred, dim=0)
+            val_prec, val_rec, val_f1, MAE, DP = Metricas.metricas_val(
+                y_true, y_pred, self.threshold)
+
+            res = f"MAE: {MAE} DP: {DP} PREC: {val_prec} REC: {val_rec} F1: {val_f1}\n"
+            print(res)
+            temp_total = round(time.time() - t1, 2)
+            results.append({
+                "experiment": num_exp,
+                "epoch": epoch,
+                "loss": round(loss_mean, 3),
+                "MAE": MAE,
+                "DP": DP,
+                "Precision": val_prec,
+                "Recall": val_rec,
+                "F1-score": val_f1,
+                "time": temp_total
+            })
+
+        return val_f1
 
 
 class Metricas:
@@ -542,9 +571,10 @@ class MyDataset(Dataset):
         return
 
 
-def plot_image_with_number(tensor_imgs: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor, names):
+def plot_image_with_number(tensor_imgs: torch.Tensor, y_true: torch.Tensor, y_pred: torch.Tensor, names, save_dir):
     """
-    Displays an image with a number caption below it.
+    Displays an image with a number caption below it and saves it to disk.\n
+    ------
     Parameters:
     - tensor_imgs: torch tensors containing one image each entry
     - y_true: torch tensors containing strabismus labels
@@ -566,34 +596,44 @@ def plot_image_with_number(tensor_imgs: torch.Tensor, y_true: torch.Tensor, y_pr
         # Add the number below the image
         str_estrab = f"PRED:{pred}, LABEL:{label}"
         plt.figtext(0.5, 0.01, str_estrab, ha='center', fontsize=12)
-        fig.savefig(path_out)
+        fig.savefig(os.path.join(save_dir, path_out))
         # Show the plot
         print("\n")
-        plt.show()
-
-    """ img = mpimg.imread(image_path)
-    sp = os.path.splitext(image_path)
-    path_out = f"{sp[0]}_OUTPUT.{sp[1]}"
-
-    # Create a figure and axis
-    fig, ax = plt.subplots()
-
-    # Display the image
-    ax.imshow(img)
-    ax.axis('off')  # Hide the axes
-
-    # Add the number below the image
-    pred = estrab[0]
-    label = estrab[1]
-    str_estrab = f"PRED:{pred}, LABEL:{label}"
-    plt.figtext(0.5, 0.01, str_estrab, ha='center', fontsize=12)
-    plt.savefig(path_out)
-    # Show the plot
-    plt.show() """
+        plt.close()
+        # plt.show()
 
 
-# -------------------------------------MAIN------------------------------------#
-# MODE LOCAL == running outside of Google Colab
+def plot_ativ(ativacoes: torch.Tensor):
+
+    # Select the batch to visualize
+    act_map = ativacoes[0]
+
+    # Number of channels in the activation map
+    num_channels = act_map.shape[0]
+
+    # Determine grid size for plotting
+    grid_size = int(num_channels ** 0.5)
+    if grid_size ** 2 < num_channels:
+        grid_size += 1
+
+    fig, axes = plt.subplots(grid_size, grid_size, figsize=(15, 15))
+    fig.suptitle(f'Activation Maps for Layer: CONV', fontsize=16)
+
+    # Plot each channel's activation map
+    for i in range(grid_size * grid_size):
+        ax = axes[i // grid_size, i % grid_size]
+        if i < num_channels:
+            ax.imshow(act_map[i].cpu().numpy(), cmap='viridis')
+            ax.set_title(f'Channel {i}')
+        ax.axis('off')
+
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+
+    # -------------------------------------MAIN------------------------------------#
+    # MODE LOCAL == running outside of Google Colab
 MODO = "LOCAL"
 if os.path.exists("/content"):
     MODO = "COLAB"
