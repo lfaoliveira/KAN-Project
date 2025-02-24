@@ -3,6 +3,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset, SubsetRandomSampler
 import torch.optim as optim
 from torchvision.io import decode_image
@@ -23,8 +24,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 indexer = pd.IndexSlice
 RAND_STATE_GERAL = 42
-seed_pesos = 3
-torch.manual_seed(seed_pesos)
+torch.manual_seed(RAND_STATE_GERAL)
 # ideia principal desse modelo é fazer deteccao da bounding box com as camadas convolucionais e depois calcular estrabismo
 # com regressão na KAN
 
@@ -36,7 +36,7 @@ class Conv_KAN(nn.Module):
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
-        channel_out = [16, 32, 32]
+        channel_out = [16, 32, 32, 32, 64, 64]
         # parte convolucional
         self.conv = nn.Sequential(
             nn.Conv2d(3, channel_out[0], kernel_size=5, stride=1, padding=1),
@@ -50,7 +50,18 @@ class Conv_KAN(nn.Module):
                       kernel_size=3, stride=1, padding=1),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+            nn.Conv2d(channel_out[2], channel_out[3],
+                      kernel_size=3, stride=1, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(channel_out[3], channel_out[4],
+                      kernel_size=3, stride=1, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(channel_out[4], channel_out[5],
+                      kernel_size=3, stride=1, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU()
         )
         self.model = nn.Sequential(
             self.conv,
@@ -62,9 +73,9 @@ class Conv_KAN(nn.Module):
         )
 
         self.activations = {}
-        self._modules.get("conv").register_forward_hook(
+        self.hook_handle = self._modules.get("conv").register_forward_hook(
             self.save_activation("conv"))
-        self.model = torch.compile(self.model)
+        # self.model = torch.compile(self.model)
 
     def forward(self, x):
         return self.model(x)
@@ -109,39 +120,57 @@ class ConvModule(nn.Module):
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
-        channel_out = [16, 32, 64]
-        self.model = nn.Sequential(
-            # parte convolucional
-            nn.Conv2d(3, channel_out[0], kernel_size=5, stride=1, padding=1),
+        channel_out = [16, 32, 64, 128, 256, 512]
+        # parte convolucional
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, channel_out[0], kernel_size=7, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=1),
             nn.Conv2d(channel_out[0], channel_out[1],
                       kernel_size=3, stride=1, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.MaxPool2d(kernel_size=2, stride=1),
             nn.Conv2d(channel_out[1], channel_out[2],
                       kernel_size=3, stride=1, padding=1),
             nn.MaxPool2d(kernel_size=2, stride=2),
             nn.ReLU(),
+            nn.Conv2d(channel_out[2], channel_out[3],
+                      kernel_size=3, stride=1, padding=1),
             nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Flatten(),
+            nn.ReLU(),
+            nn.Conv2d(channel_out[3], channel_out[4],
+                      kernel_size=3, stride=1, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(channel_out[4], channel_out[5],
+                      kernel_size=3, stride=1, padding=1),
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.ReLU()
+        )
+        self.model = nn.Sequential(
+            # parte convolucional
+            self.conv,
             # parte MLP
+            nn.Flatten(),
             nn.LazyLinear(out_features=self.INPUT_MLP),
             nn.ReLU(),
             nn.LazyLinear(out_features=self.OUTPUT_MLP),
+            nn.ReLU(),
+            nn.LazyLinear(out_features=self.OUTPUT_MLP),
         )
-        self.model = torch.compile(self.model)
 
-        """ # Define the classifier head
-        self.classifier = nn.Sequential(
-            nn.Linear(out_features=num_classes),
-            # Add more layers as needed
-        )
-        # Define the bounding box regressor head
-        self.bbox_regressor = nn.Sequential(
-            nn.Linear(out_features=4),
-            # Add more layers as needed
-        ) """
+        self.activations = {}
+        self.hook_handle = self._modules.get("conv").register_forward_hook(
+            self.save_activation("conv"))
+        # self.model = torch.compile(self.model)
+
+    def forward(self, x):
+        return self.model(x)
+
+    def save_activation(self, name):
+        def hook(module, input, output):
+            self.activations[name] = output.detach()
+        return hook
 
     def forward(self, x):
         out = self.model(x)
@@ -174,23 +203,19 @@ class Trainer:
         self.y = self.dataset.labels.detach().cpu()
         self.quant_folds = 5
 
-    def train(self, epochs=100, decay_step=7, lr_decay=1e-5, early_stop=10, warmup=5):
-
-        # fn_loss = BboxLoss()  # For classification tasks
-        fn_loss = nn.MSELoss()
+    def train(self, epochs=100, decay_step=20, lr_decay=0.8, early_stop=150, warmup=5, plot_ativ=False):
+        fn_loss = nn.L1Loss()
         # variaveis auxiliares
         self.threshold = 10
-        best_f1 = 0
-        nochange = 0
+
         # num_workers = min(32, os.cpu_count() // 2)     # usar so quando nao bugar
         num_workers = 0
-        results = []
 
         kfold = GroupKFold(
             n_splits=self.quant_folds, shuffle=True, random_state=RAND_STATE_GERAL
         )
 
-        self.batch_size = 8
+        self.batch_size = 4
         num_exp = 0
 
         for train_idx, val_idx in kfold.split(self.X, self.y, groups=self.dataset.grupos_pac):
@@ -198,21 +223,23 @@ class Trainer:
             print(f"EXPERIMENTO N° {num_exp}")
             print("-------------------------------\n")
 
-            results_exp = {}
+            results = []
+            losses = []
+            model = ConvModule().to(self.device)
 
-            model = Conv_KAN().to(self.device)
             # dry run pra inicializar LazyModules
             # shape: (Batch, Canais, Height, Width)
             model(torch.ones(size=(1, 3, 512, 512)).to(self.device))
+            print("MODELO COMPILADO")
             """ NOTE!!!!!!!!!!!!!!: Treinando modelo atualmente sem fazer transfer learning proprieamente dito """
 
             optimizer = optim.Adam(
-                model.parameters(), weight_decay=1e-10, betas=(0.9, 0.99), lr=1e-2)
+                model.parameters(), weight_decay=1e-5, betas=(0.8, 0.999), lr=1e-1)
             lr_scheduler = optim.lr_scheduler.StepLR(
                 optimizer, step_size=decay_step, gamma=lr_decay
             )
 
-            best_f1 = 0
+            best_loss = 0
             nochange = 0
             self.train_dataset = Subset(self.dataset, train_idx)
             self.val_dataset = Subset(self.dataset, val_idx)
@@ -220,14 +247,13 @@ class Trainer:
             names = [
                 os.path.basename(elem) for elem in path_imgs[val_idx]]
 
-            print(names)
-
             self.TRAIN_LOADER = DataLoader(
                 self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers
             )
             self.VAL_LOADER = DataLoader(
                 self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=num_workers, drop_last=True
             )
+            print("SETUP PRONTO")
 
             for epoch in range(epochs):  # Define the number of epochs
                 model.train()
@@ -249,66 +275,94 @@ class Trainer:
                     optimizer.step()
 
                 loss_epoch = torch.stack(loss_epoch, dim=0)
-                loss_mean = loss_epoch.mean().numpy(force=True).item()
+                loss_batch = loss_epoch.mean().numpy(force=True).item()
+                if epoch > warmup:
+                    losses.append(loss_batch)
+
                 temp_batch = round(time.time() - t1, 2)
                 string_res = f"Epoch {epoch} of {epochs}, \
-                    LOSS(MSE): {round(loss_mean, 3)},  \
+                    LOSS(MAE): {round(loss_batch, 3)},  \
                     Time: {temp_batch} seconds"
 
                 print(string_res)
                 lr_scheduler.step()
                 kwargs = {
-                    "epoch": epoch, "loss_mean": loss_mean, "t1": t1}
+                    "epoch": epoch, "loss_batch": loss_batch, "t1": t1}
                 val_f1 = self.avaliar(model, results, num_exp, **kwargs)
 
-                if val_f1 != torch.nan and val_f1 > best_f1:
-                    best_f1 = val_f1
+                if loss_batch != torch.nan and loss_batch < best_loss:
+                    best_loss = loss_batch
                     nochange = 0
                 else:
                     nochange += 1
                     if nochange > early_stop + warmup:
                         break
 
-            # salvando performance final do modelo
-            model.eval()
-            y_true = []
-            y_pred = []
-            imgs = []
-            ativacoes = []
-            with torch.no_grad():
-                for batch_X, batch_y in self.VAL_LOADER:
-                    imgs.append(batch_X)
-                    y_true.append(batch_y)
-                    outputs = model(batch_X)
-                    act = model.activations['conv'].squeeze()
-                    ativacoes.append(act)
-                    y_pred.append(outputs)
-
-                tensor_imgs = torch.cat(imgs, dim=0)
-                y_true = torch.cat(y_true, dim=0)
-                y_pred = torch.cat(y_pred, dim=0)
-                dir_save = os.path.join(os.getcwd(), f"EXP {num_exp}")
-                os.makedirs(dir_save, exist_ok=True)
-                plot_image_with_number(
-                    tensor_imgs, y_true, y_pred, names, save_dir=dir_save)
-                ativacoes = torch.cat(ativacoes)
-                plot_ativ(ativacoes)
-            # fim eval
+            # saving final model performance
+            eval_losses = self.eval_modelo(
+                model, names, fn_loss, num_exp, plot_ativ)
+            # Plot the loss
+            plt.plot(losses, color='yellow', label='Train Loss')
+            plt.plot(eval_losses, label='Val Loss', color='blue')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.title('Loss Over Epochs')
+            plt.legend()
+            plt.show()
+            # Remove the hook to save the model
+            model.hook_handle.remove()
+            # torch.save(model, f"KAN_{num_exp}.pt")
 
             num_exp += 1
             del model
             gc.collect()
             torch.cuda.empty_cache()
 
-        results_df = pd.DataFrame(results)
-        results_df.to_csv("training_results_cross.csv",
-                          index=False)  # Save to CSV
+            results_df = pd.DataFrame(results)
+            results_df.to_csv(f"training_results_{num_exp}.csv",
+                              index=False)  # Save to CSV
         # print("Results:", results_df)
         return
 
+    def eval_modelo(self, model, names, fn_loss: function, num_exp, plot_ativ=False):
+        """
+        Fazendo eval final do ultimo modelo
+        """
+        losses = []
+        model.eval()
+        y_true = []
+        y_pred = []
+        imgs = []
+        ativacoes = []
+        with torch.no_grad():
+            for batch_X, batch_y in self.VAL_LOADER:
+                imgs.append(batch_X)
+                y_true.append(batch_y)
+                outputs = model(batch_X)
+                loss = fn_loss(outputs, batch_y)
+                losses.append(loss)
+                act = model.activations['conv'].squeeze()
+                ativacoes.append(act)
+                y_pred.append(outputs)
+
+            tensor_imgs = torch.cat(imgs, dim=0)
+            y_true = torch.cat(y_true, dim=0)
+            y_pred = torch.cat(y_pred, dim=0)
+
+            dir_save = os.path.join(os.getcwd(), f"EXP {num_exp}")
+            os.makedirs(dir_save, exist_ok=True)
+            plot_image_with_number(
+                tensor_imgs, y_true, y_pred, names, save_dir=dir_save)
+            if plot_ativ:
+                ativacoes = torch.cat(ativacoes)
+                # plotar feature maps
+                plot_maps(ativacoes)
+
+            return losses
+
     def avaliar(self, model, results, num_exp, **kwargs):
         epoch = kwargs.get('epoch', None)
-        loss_mean = kwargs.get('loss_mean', None)
+        loss_batch = kwargs.get('loss_batch', None)
         t1 = kwargs.get('t1', None)
         # Validation loop
         model.eval()
@@ -329,9 +383,8 @@ class Trainer:
             print(res)
             temp_total = round(time.time() - t1, 2)
             results.append({
-                "experiment": num_exp,
                 "epoch": epoch,
-                "loss": round(loss_mean, 3),
+                "loss": round(loss_batch, 3),
                 "MAE": MAE,
                 "DP": DP,
                 "Precision": val_prec,
@@ -374,11 +427,11 @@ class Metricas:
         f1 = torch.divide(torch.multiply(
             2*precision, recall), torch.add(precision, recall))
 
-        precision = precision.detach().round(decimals=2).cpu().item()
-        recall = recall.detach().round(decimals=2).cpu().item()
-        f1 = f1.detach().round(decimals=2).cpu().item()
-        MAE = MAE.detach().round(decimals=2).cpu().item()
-        DP_ERRO = DP_ERRO.detach().round(decimals=2).cpu().item()
+        precision = precision.detach().round(decimals=2).numpy(force=True)
+        recall = recall.detach().round(decimals=2).numpy(force=True)
+        f1 = f1.detach().round(decimals=2).numpy(force=True)
+        MAE = MAE.detach().round(decimals=2).numpy(force=True)
+        DP_ERRO = DP_ERRO.detach().round(decimals=2).numpy(force=True)
 
         return precision, recall, f1, MAE, DP_ERRO
 
@@ -591,7 +644,7 @@ def plot_image_with_number(tensor_imgs: torch.Tensor, y_true: torch.Tensor, y_pr
         # Create a figure and axis
         fig, ax = plt.subplots()
         # Display the image
-        ax.imshow(img)
+        # ax.imshow(img)
         ax.axis('off')  # Hide the axes
         # Add the number below the image
         str_estrab = f"PRED:{pred}, LABEL:{label}"
@@ -603,7 +656,7 @@ def plot_image_with_number(tensor_imgs: torch.Tensor, y_true: torch.Tensor, y_pr
         # plt.show()
 
 
-def plot_ativ(ativacoes: torch.Tensor):
+def plot_maps(ativacoes: torch.Tensor):
 
     # Select the batch to visualize
     act_map = ativacoes[0]
@@ -675,5 +728,4 @@ if __name__ == '__main__':
     path_tabela = os.path.join(PATH_DATASET, filename_tabela)
     trainer = Trainer(PATH_YOLO, filename_tabela)
     freeze_support()
-    trainer.train(epochs=100, early_stop=10)
-    # trainer.train(epochs=10)
+    trainer.train(epochs=100, early_stop=50)

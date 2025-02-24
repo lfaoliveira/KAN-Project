@@ -1,5 +1,6 @@
 NOTEBOOKS
 .venv
+.vscode
 .conda
 YOLO
 *lock*
