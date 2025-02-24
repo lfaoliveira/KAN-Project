@@ -9,6 +9,7 @@ import torch.optim as optim
 from torchvision.io import decode_image
 from torchvision.transforms.functional import resize
 import pandas as pd
+import random
 import os
 import gc
 import shutil
@@ -25,19 +26,24 @@ torch.backends.cudnn.allow_tf32 = True
 indexer = pd.IndexSlice
 RAND_STATE_GERAL = 42
 torch.manual_seed(RAND_STATE_GERAL)
+torch.cuda.manual_seed(RAND_STATE_GERAL)
+torch.cuda.manual_seed_all(RAND_STATE_GERAL)
+random.seed(RAND_STATE_GERAL)
+np.random.seed(RAND_STATE_GERAL)
+
 # ideia principal desse modelo é fazer deteccao da bounding box com as camadas convolucionais e depois calcular estrabismo
 # com regressão na KAN
 
 
 class Conv_KAN(nn.Module):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, plot_ativ=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.INPUT_MLP = 100
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
-        channel_out = [16, 32, 32, 32, 64, 64]
         # parte convolucional
+        channel_out = [16, 32, 32, 32, 64, 64]
         self.conv = nn.Sequential(
             nn.Conv2d(3, channel_out[0], kernel_size=5, stride=1, padding=1),
             nn.ReLU(),
@@ -66,16 +72,14 @@ class Conv_KAN(nn.Module):
         self.model = nn.Sequential(
             self.conv,
             nn.Flatten(),
-            KAN(width=[10, 10, 10], grid=12, k=5, symbolic_enabled=False),
-            # nn.Dropout(p=0.5),
-            KAN(width=[10, 10, 10], grid=12, k=5, symbolic_enabled=False),
-            KAN(width=[10, 10, 2], grid=12, k=5, symbolic_enabled=False)
+            KAN(width=[10, 10, 10, 10, 2], grid=12, k=5,
+                symbolic_enabled=False, seed=RAND_STATE_GERAL),
         )
-
-        self.activations = {}
-        self.hook_handle = self._modules.get("conv").register_forward_hook(
-            self.save_activation("conv"))
-        # self.model = torch.compile(self.model)
+        if plot_ativ:
+            self.activations = {}
+            self.hook_handle = self._modules.get("conv").register_forward_hook(
+                self.save_activation("conv"))
+            # self.model = torch.compile(self.model)
 
     def forward(self, x):
         return self.model(x)
@@ -86,66 +90,31 @@ class Conv_KAN(nn.Module):
         return hook
 
 
-""" class BboxLoss(nn.Module):
-    '''Criterion class for computing training losses during training. Uses GIoU as a main loss'''
-
-    def __init__(self):
-        '''Initialize the BboxLoss module'''
-        super().__init__()
-
-    def forward(
-        self,
-        class_logits,
-        bbox_preds,
-        labels,
-        bbox_targets,
-    ):
-        '''IoU loss.
-        # weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = Metricas.bbox_iou(
-            pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, GIoU=True
-        )
-        loss_iou = ((1.0 - iou)).sum() / target_scores_sum
-        '''
-        classification_loss = F.cross_entropy(class_logits, labels)
-        bbox_loss = F.smooth_l1_loss(bbox_preds, bbox_targets)
-        return classification_loss + bbox_loss
- """
-
-
 class ConvModule(nn.Module):
-    def __init__(self):
+    def __init__(self, plot_ativ=False):
         super(ConvModule, self).__init__()
-        self.INPUT_MLP = 100
+        self.INPUT_MLP = 500
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
-        channel_out = [16, 32, 64, 128, 256, 512]
+        channel_out = [128, 64, 32, 16]
         # parte convolucional
         self.conv = nn.Sequential(
             nn.Conv2d(3, channel_out[0], kernel_size=7, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=1),
             nn.Conv2d(channel_out[0], channel_out[1],
-                      kernel_size=3, stride=1, padding=1),
+                      kernel_size=5, stride=1, padding=1),
             nn.ReLU(),
             nn.MaxPool2d(kernel_size=2, stride=1),
             nn.Conv2d(channel_out[1], channel_out[2],
                       kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.MaxPool2d(kernel_size=2, stride=1),
             nn.ReLU(),
             nn.Conv2d(channel_out[2], channel_out[3],
                       kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.MaxPool2d(kernel_size=2, stride=1),
             nn.ReLU(),
-            nn.Conv2d(channel_out[3], channel_out[4],
-                      kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(channel_out[4], channel_out[5],
-                      kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.ReLU()
         )
         self.model = nn.Sequential(
             # parte convolucional
@@ -158,10 +127,10 @@ class ConvModule(nn.Module):
             nn.ReLU(),
             nn.LazyLinear(out_features=self.OUTPUT_MLP),
         )
-
-        self.activations = {}
-        self.hook_handle = self._modules.get("conv").register_forward_hook(
-            self.save_activation("conv"))
+        if plot_ativ:
+            self.activations = {}
+            self.hook_handle = self._modules.get("conv").register_forward_hook(
+                self.save_activation("conv"))
         # self.model = torch.compile(self.model)
 
     def forward(self, x):
@@ -208,6 +177,10 @@ class Trainer:
         # variaveis auxiliares
         self.threshold = 10
 
+        # Ensure deterministic behavior for CUDA operations
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
         # num_workers = min(32, os.cpu_count() // 2)     # usar so quando nao bugar
         num_workers = 0
 
@@ -224,8 +197,9 @@ class Trainer:
             print("-------------------------------\n")
 
             results = []
-            losses = []
-            model = ConvModule().to(self.device)
+            train_losses = []
+            eval_losses = []
+            model = ConvModule(plot_ativ).to(self.device)
 
             # dry run pra inicializar LazyModules
             # shape: (Batch, Canais, Height, Width)
@@ -234,9 +208,9 @@ class Trainer:
             """ NOTE!!!!!!!!!!!!!!: Treinando modelo atualmente sem fazer transfer learning proprieamente dito """
 
             optimizer = optim.Adam(
-                model.parameters(), weight_decay=1e-5, betas=(0.8, 0.999), lr=1e-1)
-            lr_scheduler = optim.lr_scheduler.StepLR(
-                optimizer, step_size=decay_step, gamma=lr_decay
+                model.parameters(), weight_decay=1e-2, betas=(0.9, 0.999), lr=1e-1)
+            lr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                optimizer, eta_min=1e-5, T_0=warmup
             )
 
             best_loss = 0
@@ -276,9 +250,11 @@ class Trainer:
 
                 loss_epoch = torch.stack(loss_epoch, dim=0)
                 loss_batch = loss_epoch.mean().numpy(force=True).item()
-                if epoch > warmup:
-                    losses.append(loss_batch)
-
+                if epoch + 1 > warmup:
+                    if loss_batch < 500:
+                        train_losses.append(float(loss_batch))
+                    else:
+                        train_losses.append(None)
                 temp_batch = round(time.time() - t1, 2)
                 string_res = f"Epoch {epoch} of {epochs}, \
                     LOSS(MAE): {round(loss_batch, 3)},  \
@@ -286,25 +262,32 @@ class Trainer:
 
                 print(string_res)
                 lr_scheduler.step()
+
                 kwargs = {
                     "epoch": epoch, "loss_batch": loss_batch, "t1": t1}
-                val_f1 = self.avaliar(model, results, num_exp, **kwargs)
+                val_f1, val_loss = self.avaliar(
+                    model, results, fn_loss, **kwargs)
+                eval_losses.append(val_loss)
 
-                if loss_batch != torch.nan and loss_batch < best_loss:
-                    best_loss = loss_batch
+                if val_loss != torch.nan and val_loss < best_loss:
+                    best_loss = val_loss
                     nochange = 0
                 else:
                     nochange += 1
                     if nochange > early_stop + warmup:
                         break
+            if loss_batch < 500:
+                train_losses.append(float(loss_batch))
 
             # saving final model performance
-            eval_losses = self.eval_modelo(
-                model, names, fn_loss, num_exp, plot_ativ)
+            self.eval_modelo(
+                model, names, num_exp, plot_ativ)
             # Plot the loss
-            plt.plot(losses, color='yellow', label='Train Loss')
+            plt.plot(train_losses, color='r', label='Train Loss')
             plt.plot(eval_losses, label='Val Loss', color='blue')
             plt.xlabel('Epoch')
+            # Set y-axis to start at zero
+            plt.ylim(bottom=0)
             plt.ylabel('Loss')
             plt.title('Loss Over Epochs')
             plt.legend()
@@ -324,11 +307,10 @@ class Trainer:
         # print("Results:", results_df)
         return
 
-    def eval_modelo(self, model, names, fn_loss: function, num_exp, plot_ativ=False):
+    def eval_modelo(self, model, names, num_exp, plot_ativ=False):
         """
         Fazendo eval final do ultimo modelo
         """
-        losses = []
         model.eval()
         y_true = []
         y_pred = []
@@ -339,8 +321,6 @@ class Trainer:
                 imgs.append(batch_X)
                 y_true.append(batch_y)
                 outputs = model(batch_X)
-                loss = fn_loss(outputs, batch_y)
-                losses.append(loss)
                 act = model.activations['conv'].squeeze()
                 ativacoes.append(act)
                 y_pred.append(outputs)
@@ -358,9 +338,9 @@ class Trainer:
                 # plotar feature maps
                 plot_maps(ativacoes)
 
-            return losses
+            return
 
-    def avaliar(self, model, results, num_exp, **kwargs):
+    def avaliar(self, model, results, fn_loss, **kwargs):
         epoch = kwargs.get('epoch', None)
         loss_batch = kwargs.get('loss_batch', None)
         t1 = kwargs.get('t1', None)
@@ -369,31 +349,36 @@ class Trainer:
         y_true = []
         y_pred = []
         with torch.no_grad():
+            media = []
             for batch_X, batch_y in self.VAL_LOADER:
                 y_true.append(batch_y)
                 outputs = model(batch_X)
+                loss = fn_loss(outputs, batch_y)
+                media.append(loss)
                 y_pred.append(outputs)
 
             y_true = torch.stack(y_true, dim=0)
             y_pred = torch.stack(y_pred, dim=0)
-            val_prec, val_rec, val_f1, MAE, DP = Metricas.metricas_val(
+            loss = torch.stack(media, dim=0).mean().item().__float__()
+            val_prec, val_rec, val_f1, DP = Metricas.metricas_val(
                 y_true, y_pred, self.threshold)
 
-            res = f"MAE: {MAE} DP: {DP} PREC: {val_prec} REC: {val_rec} F1: {val_f1}\n"
+            res = f"LOSS_VAL: {loss} PREC: {val_prec} REC: {val_rec} F1: {val_f1}\n"
             print(res)
             temp_total = round(time.time() - t1, 2)
             results.append({
                 "epoch": epoch,
-                "loss": round(loss_batch, 3),
-                "MAE": MAE,
+                "train_loss": round(loss_batch, 3),
+                "MAE": loss,
                 "DP": DP,
                 "Precision": val_prec,
                 "Recall": val_rec,
                 "F1-score": val_f1,
                 "time": temp_total
             })
-
-        return val_f1
+        if loss >= 500:
+            loss = None
+        return val_f1, loss
 
 
 class Metricas:
@@ -403,7 +388,6 @@ class Metricas:
     @staticmethod
     def metricas_val(y_true: torch.Tensor, y_pred: torch.Tensor, threshold: float):
         abs_error = torch.abs(torch.sub(y_true, y_pred))
-        MAE = torch.mean(abs_error)
         DP_ERRO = torch.std(abs_error)
         TP = torch.count_nonzero(torch.where(abs_error <= threshold, 1, 0))
         # print(TP)
@@ -427,13 +411,15 @@ class Metricas:
         f1 = torch.divide(torch.multiply(
             2*precision, recall), torch.add(precision, recall))
 
-        precision = precision.detach().round(decimals=2).numpy(force=True)
-        recall = recall.detach().round(decimals=2).numpy(force=True)
-        f1 = f1.detach().round(decimals=2).numpy(force=True)
-        MAE = MAE.detach().round(decimals=2).numpy(force=True)
-        DP_ERRO = DP_ERRO.detach().round(decimals=2).numpy(force=True)
+        precision = precision.detach().round(decimals=2).numpy(force=True).item()
+        recall = recall.detach().round(decimals=2).numpy(force=True).item()
+        f1 = f1.detach().round(decimals=2).numpy(force=True).item()
+        DP_ERRO = DP_ERRO.detach().round(decimals=2).numpy(force=True).item()
 
-        return precision, recall, f1, MAE, DP_ERRO
+        precision, recall, f1, DP_ERRO = round(precision, 2), round(
+            recall, 2), round(f1, 2), round(DP_ERRO, 2)
+
+        return precision, recall, f1, DP_ERRO
 
     @staticmethod
     def bbox_iou(box1, box2, xywh=True, GIoU=False, eps=1e-7):
@@ -651,9 +637,9 @@ def plot_image_with_number(tensor_imgs: torch.Tensor, y_true: torch.Tensor, y_pr
         plt.figtext(0.5, 0.01, str_estrab, ha='center', fontsize=12)
         fig.savefig(os.path.join(save_dir, path_out))
         # Show the plot
-        print("\n")
-        plt.close()
+        # print("\n")
         # plt.show()
+        plt.close()
 
 
 def plot_maps(ativacoes: torch.Tensor):
@@ -683,7 +669,6 @@ def plot_maps(ativacoes: torch.Tensor):
     plt.tight_layout()
     plt.show()
     plt.close()
-
 
     # -------------------------------------MAIN------------------------------------#
     # MODE LOCAL == running outside of Google Colab
@@ -728,4 +713,4 @@ if __name__ == '__main__':
     path_tabela = os.path.join(PATH_DATASET, filename_tabela)
     trainer = Trainer(PATH_YOLO, filename_tabela)
     freeze_support()
-    trainer.train(epochs=100, early_stop=50)
+    trainer.train(epochs=100, early_stop=25, plot_ativ=True)
