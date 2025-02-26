@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.functional as F
-from torch.utils.data import DataLoader, Dataset, Subset, TensorDataset, SubsetRandomSampler
+from torch.utils.data import DataLoader, Dataset, Subset
 import torch.optim as optim
 from torchvision.io import decode_image
 from torchvision.transforms.functional import resize
@@ -13,15 +13,18 @@ import random
 import os
 import gc
 import shutil
-from sklearn.model_selection import GroupKFold, KFold
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupKFold
 import matplotlib.pyplot as plt
-import matplotlib.image as mpimg
+import albumentations
 from kan import KAN
 
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+# Ensure deterministic behavior for CUDA operations
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 indexer = pd.IndexSlice
 RAND_STATE_GERAL = 42
@@ -43,36 +46,16 @@ class Conv_KAN(nn.Module):
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
         # parte convolucional
-        channel_out = [16, 32, 32, 32, 64, 64]
+        channels = [64, 128, 256, 512]
         self.conv = nn.Sequential(
-            nn.Conv2d(3, channel_out[0], kernel_size=5, stride=1, padding=1),
+            nn.Conv2d(3, channels[0], kernel_size=7, stride=2, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=1),
-            nn.Conv2d(channel_out[0], channel_out[1],
-                      kernel_size=3, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(channel_out[1], channel_out[2],
-                      kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(channel_out[2], channel_out[3],
-                      kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(channel_out[3], channel_out[4],
-                      kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(channel_out[4], channel_out[5],
-                      kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.ReLU()
+            self.setup_conv(channels)
         )
         self.model = nn.Sequential(
             self.conv,
             nn.Flatten(),
-            KAN(width=[10, 10, 10, 10, 2], grid=12, k=5,
+            KAN(width=[512, 10, 10, 10, 2], grid=12, k=5,
                 symbolic_enabled=False, seed=RAND_STATE_GERAL),
         )
         if plot_ativ:
@@ -80,6 +63,15 @@ class Conv_KAN(nn.Module):
             self.hook_handle = self._modules.get("conv").register_forward_hook(
                 self.save_activation("conv"))
             # self.model = torch.compile(self.model)
+
+    def setup_conv(self, channels) -> nn.Sequential:
+        a = nn.Sequential()
+        for i in range(len(channels) - 1):
+            a.append(nn.Conv2d(channels[i], channels[i + 1],
+                               kernel_size=3, stride=1, padding=1))
+            a.append(nn.ReLU())
+            a.append(nn.MaxPool2d(kernel_size=2, stride=2))
+        return a
 
     def forward(self, x):
         return self.model(x)
@@ -97,24 +89,13 @@ class ConvModule(nn.Module):
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
-        channel_out = [128, 64, 32, 16]
+        channel_out = [64, 128, 256, 512]
+
         # parte convolucional
         self.conv = nn.Sequential(
-            nn.Conv2d(3, channel_out[0], kernel_size=7, stride=1, padding=1),
+            nn.Conv2d(3, channel_out[0], kernel_size=7, stride=2, padding=1),
             nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=1),
-            nn.Conv2d(channel_out[0], channel_out[1],
-                      kernel_size=5, stride=1, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=1),
-            nn.Conv2d(channel_out[1], channel_out[2],
-                      kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=1),
-            nn.ReLU(),
-            nn.Conv2d(channel_out[2], channel_out[3],
-                      kernel_size=3, stride=1, padding=1),
-            nn.MaxPool2d(kernel_size=2, stride=1),
-            nn.ReLU(),
+            self.setup_conv(channel_out)
         )
         self.model = nn.Sequential(
             # parte convolucional
@@ -132,6 +113,15 @@ class ConvModule(nn.Module):
             self.hook_handle = self._modules.get("conv").register_forward_hook(
                 self.save_activation("conv"))
         # self.model = torch.compile(self.model)
+
+    def setup_conv(self, channels) -> nn.Sequential:
+        a = nn.Sequential()
+        for i in range(len(channels) - 1):
+            a.append(nn.Conv2d(channels[i], channels[i + 1],
+                               kernel_size=3, stride=1, padding=1))
+            a.append(nn.ReLU())
+            a.append(nn.MaxPool2d(kernel_size=2, stride=2))
+        return a
 
     def forward(self, x):
         return self.model(x)
@@ -177,10 +167,6 @@ class Trainer:
         # variaveis auxiliares
         self.threshold = 10
 
-        # Ensure deterministic behavior for CUDA operations
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
         # num_workers = min(32, os.cpu_count() // 2)     # usar so quando nao bugar
         num_workers = 0
 
@@ -199,7 +185,7 @@ class Trainer:
             results = []
             train_losses = []
             eval_losses = []
-            model = ConvModule(plot_ativ).to(self.device)
+            model = Conv_KAN(plot_ativ).to(self.device)
 
             # dry run pra inicializar LazyModules
             # shape: (Batch, Canais, Height, Width)
@@ -208,9 +194,9 @@ class Trainer:
             """ NOTE!!!!!!!!!!!!!!: Treinando modelo atualmente sem fazer transfer learning proprieamente dito """
 
             optimizer = optim.Adam(
-                model.parameters(), weight_decay=1e-2, betas=(0.9, 0.999), lr=1e-1)
+                model.parameters(), weight_decay=1e-2, betas=(0.9, 0.999), lr=1e-2)
             lr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-                optimizer, eta_min=1e-5, T_0=warmup
+                optimizer, eta_min=1e-10, T_0=warmup
             )
 
             best_loss = 0
@@ -251,7 +237,7 @@ class Trainer:
                 loss_epoch = torch.stack(loss_epoch, dim=0)
                 loss_batch = loss_epoch.mean().numpy(force=True).item()
                 if epoch + 1 > warmup:
-                    if loss_batch < 500:
+                    if loss_batch < 100:
                         train_losses.append(float(loss_batch))
                     else:
                         train_losses.append(None)
@@ -269,7 +255,7 @@ class Trainer:
                     model, results, fn_loss, **kwargs)
                 eval_losses.append(val_loss)
 
-                if val_loss != torch.nan and val_loss < best_loss:
+                if val_loss != None and val_loss != torch.nan and val_loss < best_loss:
                     best_loss = val_loss
                     nochange = 0
                 else:
@@ -502,6 +488,31 @@ class MyDataset(Dataset):
         Retorna imagem(tensor torch) e label(tensor torch)
         """
         image = self.data[idx]
+        # Apply Albumentations transformations
+        transform = albumentations.Compose([
+            albumentations.ShiftScaleRotate(
+                shift_limit=(-0.1, 0.1), scale_limit=(-0.1, 0.1), rotate_limit=(-10, 10), p=0.8),
+            albumentations.RandomBrightnessContrast(
+                brightness_limit=(-0.3, 0.3), contrast_limit=(-0.3, 0.3), p=0.8),
+            albumentations.HorizontalFlip(p=0.8),
+        ])
+        augmented = transform(
+            image=image.detach().cpu().numpy().transpose(1, 2, 0) / 255.0)
+
+        image = torch.tensor(augmented['image'].transpose(
+            2, 0, 1), dtype=torch.float32, device=image.device)
+
+        """        # Normalize the image for plotting
+        img_plot = augmented['image']
+
+        # Plot and show the transformed image
+        plt.figure()
+        plt.imshow(img_plot)
+        plt.title(f'Transformed Image {idx}')
+        plt.axis('off')
+        plt.show()
+        plt.close() """
+
         label = self.labels[idx]
         return image, label
 
@@ -643,9 +654,11 @@ def plot_image_with_number(tensor_imgs: torch.Tensor, y_true: torch.Tensor, y_pr
 
 
 def plot_maps(ativacoes: torch.Tensor):
-
     # Select the batch to visualize
     act_map = ativacoes[0]
+
+    # Filter out empty sub-tensors
+    act_map = torch.stack([x for x in act_map if torch.any(x)])
 
     # Number of channels in the activation map
     num_channels = act_map.shape[0]
@@ -655,23 +668,28 @@ def plot_maps(ativacoes: torch.Tensor):
     if grid_size ** 2 < num_channels:
         grid_size += 1
 
-    fig, axes = plt.subplots(grid_size, grid_size, figsize=(15, 15))
+    fig, axes = plt.subplots(grid_size, grid_size, figsize=(30, 30))
     fig.suptitle(f'Activation Maps for Layer: CONV', fontsize=16)
 
     # Plot each channel's activation map
     for i in range(grid_size * grid_size):
         ax = axes[i // grid_size, i % grid_size]
         if i < num_channels:
-            ax.imshow(act_map[i].cpu().numpy(), cmap='viridis')
-            ax.set_title(f'Channel {i}')
+            channel_map = act_map[i].cpu().numpy()
+            ax.imshow(channel_map, cmap='viridis')
+            ax.set_title(f'Channel {i}', fontsize=8)
+        else:
+            ax.axis('off')
+
         ax.axis('off')
 
     plt.tight_layout()
     plt.show()
     plt.close()
 
-    # -------------------------------------MAIN------------------------------------#
-    # MODE LOCAL == running outside of Google Colab
+
+# -------------------------------------MAIN------------------------------------#
+# MODE LOCAL == running outside of Google Colab
 MODO = "LOCAL"
 if os.path.exists("/content"):
     MODO = "COLAB"
