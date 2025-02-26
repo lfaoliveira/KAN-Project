@@ -41,12 +41,13 @@ np.random.seed(RAND_STATE_GERAL)
 class Conv_KAN(nn.Module):
     def __init__(self, plot_ativ=False, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.INPUT_MLP = 100
+        self.INPUT_MLP = 512
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
         # parte convolucional
         channels = [64, 128, 256, 512]
+        self.INPUT_MLP = channels[-1]
         self.conv = nn.Sequential(
             nn.Conv2d(3, channels[0], kernel_size=7, stride=2, padding=1),
             nn.ReLU(),
@@ -55,7 +56,7 @@ class Conv_KAN(nn.Module):
         self.model = nn.Sequential(
             self.conv,
             nn.Flatten(),
-            KAN(width=[512, 10, 10, 10, 2], grid=12, k=5,
+            KAN(width=[self.INPUT_MLP, 10, 10, 10, self.OUTPUT_MLP], grid=12, k=5,
                 symbolic_enabled=False, seed=RAND_STATE_GERAL),
         )
         if plot_ativ:
@@ -85,11 +86,12 @@ class Conv_KAN(nn.Module):
 class ConvModule(nn.Module):
     def __init__(self, plot_ativ=False):
         super(ConvModule, self).__init__()
-        self.INPUT_MLP = 500
+
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
         channel_out = [64, 128, 256, 512]
+        self.INPUT_MLP = channel_out[-1]
 
         # parte convolucional
         self.conv = nn.Sequential(
@@ -187,6 +189,12 @@ class Trainer:
             eval_losses = []
             model = Conv_KAN(plot_ativ).to(self.device)
 
+            model_str = ""
+            if isinstance(model, Conv_KAN):
+                model_str = "KAN"
+            else:
+                model_str = "MLP"
+
             # dry run pra inicializar LazyModules
             # shape: (Batch, Canais, Height, Width)
             model(torch.ones(size=(1, 3, 512, 512)).to(self.device))
@@ -250,7 +258,7 @@ class Trainer:
                 lr_scheduler.step()
 
                 kwargs = {
-                    "epoch": epoch, "loss_batch": loss_batch, "t1": t1}
+                    "epoch": epoch, "loss_batch": float(loss_batch), "t1": t1}
                 val_f1, val_loss = self.avaliar(
                     model, results, fn_loss, **kwargs)
                 eval_losses.append(val_loss)
@@ -288,8 +296,9 @@ class Trainer:
             torch.cuda.empty_cache()
 
             results_df = pd.DataFrame(results)
-            results_df.to_csv(f"training_results_{num_exp}.csv",
-                              index=False)  # Save to CSV
+            results_df.to_csv(f"training_results_{model_str}_{num_exp}.csv",
+                              index=False, decimal=",")  # Save to CSV
+            break
         # print("Results:", results_df)
         return
 
@@ -345,7 +354,7 @@ class Trainer:
 
             y_true = torch.stack(y_true, dim=0)
             y_pred = torch.stack(y_pred, dim=0)
-            loss = torch.stack(media, dim=0).mean().item().__float__()
+            loss = torch.stack(media, dim=0).mean().item()
             val_prec, val_rec, val_f1, DP = Metricas.metricas_val(
                 y_true, y_pred, self.threshold)
 
@@ -502,7 +511,7 @@ class MyDataset(Dataset):
         image = torch.tensor(augmented['image'].transpose(
             2, 0, 1), dtype=torch.float32, device=image.device)
 
-        """        # Normalize the image for plotting
+        # Normalize the image for plotting
         img_plot = augmented['image']
 
         # Plot and show the transformed image
@@ -511,7 +520,7 @@ class MyDataset(Dataset):
         plt.title(f'Transformed Image {idx}')
         plt.axis('off')
         plt.show()
-        plt.close() """
+        plt.close()
 
         label = self.labels[idx]
         return image, label
