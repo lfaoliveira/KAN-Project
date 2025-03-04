@@ -7,6 +7,7 @@ import torch.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 import torch.optim as optim
 from torchvision.io import decode_image
+import torchvision.models
 from torchvision.transforms.functional import resize
 import pandas as pd
 import random
@@ -43,20 +44,17 @@ class Conv_KAN(nn.Module):
         super().__init__(*args, **kwargs)
         self.INPUT_MLP = 512
         # 2 numeros para a MLP
-        self.OUTPUT_MLP = 2
         # Define the backbone CNN
-        # parte convolucional
-        channels = [64, 128, 256, 512]
-        self.INPUT_MLP = channels[-1]
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, channels[0], kernel_size=7, stride=2, padding=1),
-            nn.ReLU(),
-            self.setup_conv(channels)
-        )
+        cfg = [3, 64, 64, "M", 128, 128, "M", 256, 256,
+               256, "M", 512, 512, 512, "M", 512, 512, 512, "M"]
+
+        self.INPUT_MLP = 4096
+        self.conv = self.setup_conv(cfg)
+
         self.model = nn.Sequential(
             self.conv,
             nn.Flatten(),
-            KAN(width=[self.INPUT_MLP, 10, 10, 10, self.OUTPUT_MLP], grid=12, k=5,
+            KAN(width=[self.INPUT_MLP, 20, 20, 20, self.OUTPUT_MLP], grid=12, k=5,
                 symbolic_enabled=False, seed=RAND_STATE_GERAL),
         )
         if plot_ativ:
@@ -65,14 +63,21 @@ class Conv_KAN(nn.Module):
                 self.save_activation("conv"))
             # self.model = torch.compile(self.model)
 
-    def setup_conv(self, channels) -> nn.Sequential:
-        a = nn.Sequential()
-        for i in range(len(channels) - 1):
-            a.append(nn.Conv2d(channels[i], channels[i + 1],
-                               kernel_size=3, stride=1, padding=1))
-            a.append(nn.ReLU())
-            a.append(nn.MaxPool2d(kernel_size=2, stride=2))
-        return a
+    def setup_conv(self, cfg) -> nn.Sequential:
+        # so confia que funciona
+        layers = []
+        in_channels = 3
+        for v in cfg:
+            if v == "M":
+                layers.append([nn.MaxPool2d(kernel_size=2, stride=2)])
+            else:
+                v = int(v)
+                conv2d = nn.Conv2d(
+                    in_channels, v, kernel_size=3, stride=1, padding=1)
+                layers.append([conv2d, nn.ReLU(inplace=True)])
+                in_channels = v
+
+        return nn.Sequential(*layers)
 
     def forward(self, x):
         return self.model(x)
@@ -90,43 +95,47 @@ class ConvModule(nn.Module):
         # 2 numeros para a MLP
         self.OUTPUT_MLP = 2
         # Define the backbone CNN
-        channel_out = [64, 128, 256, 512]
-        self.INPUT_MLP = channel_out[-1]
+        cfg = [3, 64, 64, "M", 128, 128, "M", 256, 256,
+               256, "M", 512, 512, 512, "M", 512, 512, 512, "M"]
+
+        self.INPUT_MLP = 4096
 
         # parte convolucional
-        self.conv = nn.Sequential(
-            nn.Conv2d(3, channel_out[0], kernel_size=7, stride=2, padding=1),
-            nn.ReLU(),
-            self.setup_conv(channel_out)
-        )
+        self.conv = self.setup_conv(cfg)
+
         self.model = nn.Sequential(
-            # parte convolucional
             self.conv,
-            # parte MLP
             nn.Flatten(),
             nn.LazyLinear(out_features=self.INPUT_MLP),
             nn.ReLU(),
-            nn.LazyLinear(out_features=self.OUTPUT_MLP),
+            nn.LazyLinear(out_features=self.INPUT_MLP),
             nn.ReLU(),
-            nn.LazyLinear(out_features=self.OUTPUT_MLP),
+            # strab horizontal e vertical
+            nn.LazyLinear(out_features=2),
+            nn.ReLU(),
         )
         if plot_ativ:
             self.activations = {}
             self.hook_handle = self._modules.get("conv").register_forward_hook(
                 self.save_activation("conv"))
-        # self.model = torch.compile(self.model)
+        else:
+            self.model = torch.compile(self.model)
 
-    def setup_conv(self, channels) -> nn.Sequential:
-        a = nn.Sequential()
-        for i in range(len(channels) - 1):
-            a.append(nn.Conv2d(channels[i], channels[i + 1],
-                               kernel_size=3, stride=1, padding=1))
-            a.append(nn.ReLU())
-            a.append(nn.MaxPool2d(kernel_size=2, stride=2))
-        return a
+    def setup_conv(self, cfg) -> nn.Sequential:
+        # so confia que funciona
+        layers = []
+        in_channels = 3
+        for v in cfg:
+            if v == "M":
+                layers.append([nn.MaxPool2d(kernel_size=2, stride=2)])
+            else:
+                v = int(v)
+                conv2d = nn.Conv2d(
+                    in_channels, v, kernel_size=3, stride=1, padding=1)
+                layers.append([conv2d, nn.ReLU(inplace=True)])
+                in_channels = v
 
-    def forward(self, x):
-        return self.model(x)
+        return nn.Sequential(*layers)
 
     def save_activation(self, name):
         def hook(module, input, output):
@@ -164,7 +173,7 @@ class Trainer:
         self.y = self.dataset.labels.detach().cpu()
         self.quant_folds = 5
 
-    def train(self, epochs=100, decay_step=20, lr_decay=0.8, early_stop=150, warmup=5, plot_ativ=False):
+    def train(self, epochs=100, df_resumo=None, decay_step=20, lr_decay=0.8, early_stop=150, warmup=5, plot_ativ=False):
         fn_loss = nn.L1Loss()
         # variaveis auxiliares
         self.threshold = 10
@@ -504,7 +513,7 @@ class MyDataset(Dataset):
             albumentations.RandomBrightnessContrast(
                 brightness_limit=(-0.3, 0.3), contrast_limit=(-0.3, 0.3), p=0.8),
             albumentations.HorizontalFlip(p=0.8),
-        ])
+        ], seed=idx)
         augmented = transform(
             image=image.detach().cpu().numpy().transpose(1, 2, 0) / 255.0)
 
