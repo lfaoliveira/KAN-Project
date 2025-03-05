@@ -178,6 +178,31 @@ class Trainer:
 
     def train(self, epochs=100, df_resumo=None, decay_step=20, lr_decay=0.8,
               early_stop=150, warmup=5, plot_ativ=False) -> pd.DataFrame:
+        """
+        Trains the model using k-fold cross validation
+
+        Parameters:
+        -----------
+        epochs : int
+            Number of training epochs
+        df_resumo : pd.DataFrame, optional
+            DataFrame to store training results across folds
+        decay_step : int 
+            Steps between learning rate decay
+        lr_decay : float
+            Learning rate decay factor
+        early_stop : int
+            Number of epochs without improvement before stopping
+        warmup : int 
+            Number of warmup epochs
+        plot_ativ : bool
+            Whether to plot activations
+
+        Returns:
+        --------
+        pd.DataFrame
+            DataFrame containing training results
+        """
         fn_loss = nn.L1Loss()
         # variaveis auxiliares
         self.threshold = 10
@@ -185,13 +210,15 @@ class Trainer:
         # num_workers = min(32, os.cpu_count() // 2)     # usar so quando nao bugar
         num_workers = 0
 
+        # Setup k-fold cross validation
         kfold = GroupKFold(
             n_splits=self.quant_folds, shuffle=True, random_state=RAND_STATE_GERAL
         )
 
         self.batch_size = 4
-        num_exp = 0
-
+        num_exp = 1
+        model_str = ""
+        # Iterate through folds
         for train_idx, val_idx in kfold.split(self.X, self.y, groups=self.dataset.grupos_pac):
             print("-------------------------------")
             print(f"EXPERIMENTO N° {num_exp}")
@@ -200,20 +227,24 @@ class Trainer:
             results = []
             train_losses = []
             eval_losses = []
+
+            # Initialize model
             model = ConvModule(plot_ativ).to(self.device)
 
-            model_str = ""
+            # Determine model type for logging
+
             if isinstance(model, Conv_KAN):
                 model_str = "KAN"
             else:
                 model_str = "MLP"
 
-            # dry run pra inicializar LazyModules
+            #  run pra inicializar LazyModules
             # shape: (Batch, Canais, Height, Width)
             model(torch.ones(size=(1, 3, 512, 512)).to(self.device))
             print("MODELO COMPILADO")
             """ NOTE!!!!!!!!!!!!!!: Treinando modelo atualmente sem fazer transfer learning proprieamente dito """
 
+            # Setup optimizer and learning rate scheduler
             optimizer = optim.Adam(
                 model.parameters(), weight_decay=1e-2, betas=(0.9, 0.999), lr=1e-2)
             lr_scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -222,12 +253,15 @@ class Trainer:
 
             best_loss = 0
             nochange = 0
+
+            # Create train/val datasets for this fold
             self.train_dataset = Subset(self.dataset, train_idx)
             self.val_dataset = Subset(self.dataset, val_idx)
             path_imgs = np.array(self.val_dataset.dataset.lista_path_img)
             names = [
                 os.path.basename(elem) for elem in path_imgs[val_idx]]
 
+            # Create data loaders
             self.TRAIN_LOADER = DataLoader(
                 self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=num_workers
             )
@@ -236,10 +270,13 @@ class Trainer:
             )
             print("SETUP PRONTO")
 
+            # Training loop
             for epoch in range(epochs):  # Define the number of epochs
                 model.train()
                 t1 = time.time()
                 loss_epoch = []
+
+                # Iterate through batches
                 for image_batch, targets in self.TRAIN_LOADER:
                     # convertion to GPU tensor
                     image_batch = image_batch.to(self.device)
@@ -255,6 +292,7 @@ class Trainer:
                     loss.backward()
                     optimizer.step()
 
+                # Calculate epoch loss
                 loss_epoch = torch.stack(loss_epoch, dim=0)
                 loss_batch = loss_epoch.mean().numpy(force=True).item()
                 if epoch + 1 > warmup:
@@ -270,12 +308,14 @@ class Trainer:
                 print(string_res)
                 lr_scheduler.step()
 
+                # Evaluate model
                 kwargs = {
                     "epoch": epoch, "loss_batch": float(loss_batch), "t1": t1}
                 val_f1, val_loss = self.avaliar(
                     model, results, fn_loss, **kwargs)
                 eval_losses.append(val_loss)
 
+                # Early stopping check
                 if val_loss != None and val_loss != torch.nan and val_loss < best_loss:
                     best_loss = val_loss
                     nochange = 0
@@ -286,36 +326,46 @@ class Trainer:
             if loss_batch < 500:
                 train_losses.append(float(loss_batch))
 
-            # saving final model performance
+            # Final evaluation and plotting
             self.eval_modelo(
                 model, names, num_exp, plot_ativ)
             # Plot the loss
             plt.plot(train_losses, color='r', label='Train Loss')
             plt.plot(eval_losses, label='Val Loss', color='blue')
             plt.xlabel('Epoch')
-            # Set y-axis to start at zero
+            # Set y-axis to start at zero (to not have varying scales)
             plt.ylim(bottom=0)
             plt.ylabel('Loss')
             plt.title('Loss Over Epochs')
             plt.legend()
             plt.show()
             # Remove the hook to save the model
-            model.hook_handle.remove()
-            # torch.save(model, f"KAN_{num_exp}.pt")
+            if plot_ativ:
+                model.hook_handle.remove()
+            else:
+                torch.save(model, f"KAN_{num_exp}.pt")
 
+            # Cleanup and save results
             num_exp += 1
             del model
             gc.collect()
             torch.cuda.empty_cache()
 
             results_df = pd.DataFrame(results)
+            indices_novos = [
+                f"FOLD_{num_exp}_{str(epoca)}" for epoca in results_df.index.tolist()]
+            results_df.index = indices_novos
+
             if df_resumo != None:
                 df_resumo = pd.concat([df_resumo, results_df])
+            else:
+                df_resumo = results_df
+
             results_df.to_csv(f"training_results_{model_str}_{num_exp}.csv",
                               index=False, decimal=",")  # Save to CSV
 
         # print("Results:", results_df)
-        return df_resumo
+        return df_resumo, model_str
 
     def eval_modelo(self, model, names, num_exp, plot_ativ=False):
         """
@@ -487,9 +537,12 @@ class MyDataset(Dataset):
         self.path_tabela = os.path.join(PATH_DATASET, filename_tabela)
         self.inicializar_dataset(PATH_YOLO)
         df_dados = self.df
-        self.lista_path_img = list(df_dados.loc[:, "PATH"].to_dict().values())
-        data = np.array([resize(decode_image(path), (512, 512))
-                        for path in self.lista_path_img], dtype=np.float32)
+        self.lista_path_img: List[str] = list(
+            df_dados.loc[:, "PATH"].to_dict().values())
+
+        a = [resize(decode_image(path), [512, 512])
+             for path in self.lista_path_img]
+        data = np.array(a, dtype=np.float32)
 
         # array com imagens
         self.data = torch.tensor(data, device=device, dtype=torch.float32)
@@ -756,5 +809,5 @@ if __name__ == '__main__':
     path_tabela = os.path.join(PATH_DATASET, filename_tabela)
     trainer = Trainer(PATH_YOLO, filename_tabela)
     freeze_support()
-    df_resumo = trainer.train(epochs=100, early_stop=25, plot_ativ=True)
-    df_resumo.to_csv("df_resumo.csv")
+    df_resumo, exp = trainer.train(epochs=100, early_stop=25, plot_ativ=True)
+    df_resumo.to_csv(f"df_resumo_{exp}.csv")
