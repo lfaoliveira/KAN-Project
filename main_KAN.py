@@ -1,6 +1,7 @@
 from multiprocessing import freeze_support
 import time
 import numpy as np
+from typing import Any, cast, Dict, List, Optional, Union
 import torch
 import torch.nn as nn
 import torch.functional as F
@@ -44,6 +45,7 @@ class Conv_KAN(nn.Module):
         super().__init__(*args, **kwargs)
         self.INPUT_MLP = 512
         # 2 numeros para a MLP
+        self.OUTPUT_MLP = 2
         # Define the backbone CNN
         cfg = [3, 64, 64, "M", 128, 128, "M", 256, 256,
                256, "M", 512, 512, 512, "M", 512, 512, 512, "M"]
@@ -63,20 +65,20 @@ class Conv_KAN(nn.Module):
                 self.save_activation("conv"))
             # self.model = torch.compile(self.model)
 
-    def setup_conv(self, cfg) -> nn.Sequential:
+    def setup_conv(self, cfg: List[Union[str, int]]) -> nn.Sequential:
         # so confia que funciona
-        layers = []
+        layers: List[nn.Module] = []
         in_channels = 3
         for v in cfg:
             if v == "M":
-                layers.append([nn.MaxPool2d(kernel_size=2, stride=2)])
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
             else:
                 v = int(v)
                 conv2d = nn.Conv2d(
                     in_channels, v, kernel_size=3, stride=1, padding=1)
-                layers.append([conv2d, nn.ReLU(inplace=True)])
+                layers.append(conv2d)
+                layers.append(nn.ReLU(inplace=True))
                 in_channels = v
-
         return nn.Sequential(*layers)
 
     def forward(self, x):
@@ -114,6 +116,7 @@ class ConvModule(nn.Module):
             nn.LazyLinear(out_features=2),
             nn.ReLU(),
         )
+        a = torchvision.models.vgg16()
         if plot_ativ:
             self.activations = {}
             self.hook_handle = self._modules.get("conv").register_forward_hook(
@@ -121,20 +124,20 @@ class ConvModule(nn.Module):
         else:
             self.model = torch.compile(self.model)
 
-    def setup_conv(self, cfg) -> nn.Sequential:
+    def setup_conv(self, cfg: List[Union[str, int]]) -> nn.Sequential:
         # so confia que funciona
-        layers = []
+        layers: List[nn.Module] = []
         in_channels = 3
         for v in cfg:
             if v == "M":
-                layers.append([nn.MaxPool2d(kernel_size=2, stride=2)])
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
             else:
                 v = int(v)
                 conv2d = nn.Conv2d(
                     in_channels, v, kernel_size=3, stride=1, padding=1)
-                layers.append([conv2d, nn.ReLU(inplace=True)])
+                layers.append(conv2d)
+                layers.append(nn.ReLU(inplace=True))
                 in_channels = v
-
         return nn.Sequential(*layers)
 
     def save_activation(self, name):
@@ -173,7 +176,8 @@ class Trainer:
         self.y = self.dataset.labels.detach().cpu()
         self.quant_folds = 5
 
-    def train(self, epochs=100, df_resumo=None, decay_step=20, lr_decay=0.8, early_stop=150, warmup=5, plot_ativ=False):
+    def train(self, epochs=100, df_resumo=None, decay_step=20, lr_decay=0.8,
+              early_stop=150, warmup=5, plot_ativ=False) -> pd.DataFrame:
         fn_loss = nn.L1Loss()
         # variaveis auxiliares
         self.threshold = 10
@@ -196,7 +200,7 @@ class Trainer:
             results = []
             train_losses = []
             eval_losses = []
-            model = Conv_KAN(plot_ativ).to(self.device)
+            model = ConvModule(plot_ativ).to(self.device)
 
             model_str = ""
             if isinstance(model, Conv_KAN):
@@ -305,11 +309,13 @@ class Trainer:
             torch.cuda.empty_cache()
 
             results_df = pd.DataFrame(results)
+            if df_resumo != None:
+                df_resumo = pd.concat([df_resumo, results_df])
             results_df.to_csv(f"training_results_{model_str}_{num_exp}.csv",
                               index=False, decimal=",")  # Save to CSV
-            break
+
         # print("Results:", results_df)
-        return
+        return df_resumo
 
     def eval_modelo(self, model, names, num_exp, plot_ativ=False):
         """
@@ -513,7 +519,7 @@ class MyDataset(Dataset):
             albumentations.RandomBrightnessContrast(
                 brightness_limit=(-0.3, 0.3), contrast_limit=(-0.3, 0.3), p=0.8),
             albumentations.HorizontalFlip(p=0.8),
-        ], seed=idx)
+        ], seed=int(idx))
         augmented = transform(
             image=image.detach().cpu().numpy().transpose(1, 2, 0) / 255.0)
 
@@ -524,12 +530,13 @@ class MyDataset(Dataset):
         img_plot = augmented['image']
 
         # Plot and show the transformed image
+        """ 
         plt.figure()
         plt.imshow(img_plot)
         plt.title(f'Transformed Image {idx}')
         plt.axis('off')
         plt.show()
-        plt.close()
+        plt.close() """
 
         label = self.labels[idx]
         return image, label
@@ -749,4 +756,5 @@ if __name__ == '__main__':
     path_tabela = os.path.join(PATH_DATASET, filename_tabela)
     trainer = Trainer(PATH_YOLO, filename_tabela)
     freeze_support()
-    trainer.train(epochs=100, early_stop=25, plot_ativ=True)
+    df_resumo = trainer.train(epochs=100, early_stop=25, plot_ativ=True)
+    df_resumo.to_csv("df_resumo.csv")
