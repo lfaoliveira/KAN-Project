@@ -17,7 +17,9 @@ def plot_dataframes_comparison(df_mlp: pd.DataFrame, df_kan: pd.DataFrame,
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
     threshold = 100  # You can adjust this threshold value
 
-    # Plot first DataFrame
+    # Rename 'MAE' to 'val_loss' in both dataframes
+    df_mlp = df_mlp.rename(columns={'MAE': 'val_loss'})
+    df_kan = df_kan.rename(columns={'MAE': 'val_loss'})
 
     # Add red dots for values above threshold
     for col in column_names:
@@ -79,6 +81,6 @@ for path_mlp, path_kan in zip(lista_mlp, lista_kan):
     title_mlp = f"FOLD_{fold} MLP"
     title_kan = f"FOLD_{fold} KAN"
     plot_dataframes_comparison(
-        df_mlp, df_kan, title_mlp, title_kan, column_names=["train_loss", "MAE"], path_save=f"LOSS_FOLD_{fold}")
+        df_mlp, df_kan, title_mlp, title_kan, column_names=["train_loss", "val_loss"], path_save=f"LOSS_FOLD_{fold}")
 
     fold += 1

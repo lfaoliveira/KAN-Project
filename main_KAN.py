@@ -771,8 +771,7 @@ def plot_maps(ativacoes: torch.Tensor):
 MODO = "LOCAL"
 if os.path.exists("/content"):
     MODO = "COLAB"
-else:
-    MODO = "LOCAL"
+
 # --SETTING PATH_DATASET-- #
 if MODO == "COLAB":
     PATH_DATASET = os.path.join("/content", "datasets")
@@ -797,7 +796,8 @@ if MODO != "LOCAL":
         )
     # raise error when dataset not present
 elif not os.path.exists(PATH_DATASET):
-    raise SystemError("Dataset not found")
+    raise SystemError(
+        "Dataset not found, please put it inside the working directory")
 
 
 if __name__ == '__main__':
