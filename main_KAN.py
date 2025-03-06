@@ -10,6 +10,8 @@ import torch.optim as optim
 from torchvision.io import decode_image
 import torchvision.models
 from torchvision.transforms.functional import resize
+from pytorch_grad_cam import GradCAM
+from pytorch_grad_cam.utils.model_targets import RegressionScoreOutputTarget
 import pandas as pd
 import random
 import os
@@ -229,7 +231,7 @@ class Trainer:
             eval_losses = []
 
             # Initialize model
-            model = ConvModule(plot_ativ).to(self.device)
+            model = Conv_KAN(plot_ativ).to(self.device)
 
             # Determine model type for logging
 
@@ -372,16 +374,38 @@ class Trainer:
         Fazendo eval final do ultimo modelo
         """
         model.eval()
+        # Defina a camada convolucional alvo.
+        # Supondo que o modelo possua um atributo 'conv' que corresponda à última camada convolucional.
+        target_layers = [model.conv]
+
+        # Cria o objeto GradCAM
+        cam = GradCAM(model=model, target_layers=target_layers, use_cuda=False)
+
         y_true = []
         y_pred = []
         imgs = []
         ativacoes = []
+        grad_cam_maps = []
+
         with torch.no_grad():
             for batch_X, batch_y in self.VAL_LOADER:
+                model.zero_grad()
                 imgs.append(batch_X)
                 y_true.append(batch_y)
                 outputs = model(batch_X)
                 act = model.activations['conv'].squeeze()
+
+                # Para regressão, criamos um target para cada imagem do batch usando o valor previsto.
+                # Assume-se que outputs seja do formato (batch_size, 1) ou (batch_size,)
+                outputs_np = outputs.squeeze().detach().cpu().numpy()
+                targets = [RegressionScoreOutputTarget(
+                    score) for score in outputs_np]
+
+                # Calcula o mapa Grad-CAM para o batch atual
+                grayscale_cam = cam(input_tensor=batch_X, targets=targets)
+                # 'grayscale_cam' tem shape (batch_size, H, W)
+                grad_cam_maps.append(grayscale_cam)
+
                 ativacoes.append(act)
                 y_pred.append(outputs)
 
@@ -393,11 +417,15 @@ class Trainer:
             os.makedirs(dir_save, exist_ok=True)
             plot_image_with_number(
                 tensor_imgs, y_true, y_pred, names, save_dir=dir_save)
-            if plot_ativ:
-                ativacoes = torch.cat(ativacoes)
-                # plotar feature maps
-                plot_maps(ativacoes)
 
+            if plot_ativ:
+                # ativacoes = torch.cat(ativacoes)
+                # Concatena todos os mapas Grad-CAM para plotagem
+
+                # grad_cam_maps = np.concatenate(grad_cam_maps, axis=0)
+                grad_cam_maps = torch.cat(
+                    [torch.from_numpy(maps) for maps in grad_cam_maps], dim=0)
+                plot_maps(grad_cam_maps)
             return
 
     def avaliar(self, model, results, fn_loss, **kwargs):
