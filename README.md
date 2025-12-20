@@ -10,11 +10,7 @@ The project consists of training a Convolutional feature extractor and Kolmogoro
 
 # Run instructions:
 `conda env create -f environment.yaml`
+
 `conda activate strabismus_KAN`
 
-
-
-
-
-
-##########conda deactivate strabismus_KAN
+`python -u ./main_KAN.py`
